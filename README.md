@@ -2,9 +2,9 @@
 
 登录与待办清单练习后端，Python + FastAPI，数据存单文件 SQLite。
 
-- 配套前端仓库：`intern-day-2-frontend`（地址：`https://github.com/<你的账号>/intern-day-2-frontend`）
-- 本仓库对应 PR：`（创建 PR 后补充）`
-- 联调分支：`feat/login-and-custom-feature`
+- 配套前端仓库：`intern-day-2-frontend`（地址：`https://github.com/13chang/intern-day-2-frontend`）
+- 本仓库对应 PR：`https://github.com/13chang/intern-day-2-backend/pull/1`
+- 联调分支：两仓库均使用 `feat/login-and-custom-feature`（同名分支，交付评审分支）
 
 ## 1. 功能范围与验收条件
 

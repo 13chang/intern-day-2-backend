@@ -1,7 +1,11 @@
 # 练习用镜像：按 uv.lock 安装依赖后由 uvicorn 启动服务
 FROM python:3.12-slim
 
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
+# 容器内默认访问不了 pypi.org / ghcr.io，构建时统一走镜像源
+ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
+    UV_DEFAULT_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple
+
+RUN pip install --no-cache-dir uv
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

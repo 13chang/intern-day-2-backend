@@ -1,0 +1,19 @@
+services:
+  backend:
+    build: .
+    image: intern-day-2-backend:local
+    container_name: intern-day-2-backend
+    ports:
+      - "8000:8000"
+    environment:
+      APP_DB_PATH: /app/data/app.db
+      APP_SESSION_TTL_SECONDS: "1800"
+      # 浏览器直接访问宿主机映射端口，来源为前端开发服务器
+      APP_CORS_ORIGINS: "http://localhost:5173,http://127.0.0.1:5173"
+      # 练习账号：可用 .env 覆盖，默认值与 README 一致
+      SEED_USERNAME: "${SEED_USERNAME:-demo}"
+      SEED_PASSWORD: "${SEED_PASSWORD:-demo1234}"
+      SEED_DISPLAY_NAME: "${SEED_DISPLAY_NAME:-练习用户}"
+    # 启动前初始化练习账号；脚本可重复执行，只会重置该账号
+    command: sh -c "python scripts/seed.py && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    restart: unless-stopped

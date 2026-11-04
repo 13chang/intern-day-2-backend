@@ -16,4 +16,10 @@ services:
       SEED_DISPLAY_NAME: "${SEED_DISPLAY_NAME:-练习用户}"
     # 启动前初始化练习账号；脚本可重复执行，只会重置该账号
     command: sh -c "python scripts/seed.py && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    # 数据卷：容器重建后数据库文件仍在；彻底重置用 docker compose down -v
+    volumes:
+      - backend-data:/app/data
     restart: unless-stopped
+
+volumes:
+  backend-data:

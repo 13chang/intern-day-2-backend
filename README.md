@@ -109,9 +109,8 @@ SEED_USERNAME=demo SEED_PASSWORD=你的密码 uv run python scripts/seed.py
 
 - 使用单文件 SQLite，路径由 `APP_DB_PATH` 决定，容器内为 `/app/data/app.db`。
 - 表：`users`、`sessions`、`items`，服务启动时自动建表（`init_db`）。
-- **保留**：容器重启（`docker restart`）后数据仍在。
-- **重置**：`docker compose down` 后重新 `up --build` 会创建新容器，数据库文件随容器重建而清空，练习账号由 seed 重新生成。
-- 未挂载数据卷；如需跨重建保留数据，可在 `compose.yaml` 中为 `/app/data` 增加命名卷。
+- **保留**：`compose.yaml` 为 `/app/data` 挂了命名卷 `backend-data`，因此 `docker restart`、`docker compose down` 后重新 `up --build`（容器被销毁重建）数据都仍在。
+- **重置**：需要清空数据时执行 `docker compose down -v`，命名卷一并删除；下次启动由 seed 重新生成练习账号。
 
 ## 8. 联调方式
 

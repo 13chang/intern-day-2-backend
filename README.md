@@ -1,13 +1,16 @@
 # intern-day-2-backend
 
 登录 + 待办清单 + Agent 对话练习后端，Python + FastAPI，数据存单文件 SQLite；
-第三天新增 Microsoft Agent Framework 与 AG-UI 事件流接入。
+第三天新增 Microsoft Agent Framework 与 AG-UI 事件流接入；
+第四天新增 Agent 评测（`tests/agent/`）、OpenTelemetry 可观测性与工具安全边界。
 
 - 配套前端仓库：`intern-day-2-frontend`（地址：`https://github.com/13chang/intern-day-2-frontend`）
 - 第二天 PR：`https://github.com/13chang/intern-day-2-backend/pull/1`（分支 `feat/login-and-custom-feature`）
 - 第三天分支：`feat/agent-chat`，第三天 PR 以 `feat/login-and-custom-feature` 为 base（第二天 PR 尚未合并，依赖关系写在 PR 正文）
+- 第四天分支：`feat/agent-eval`，以 `main` 为 base
 - 原理说明：`docs/day-3-agent-learning.md`
 - 交互图：`docs/diagrams/day-3-agent-interaction.png`
+- 第四天评测与优化记录：`docs/day-4-agent-optimization.md`
 
 ## 1. 功能范围与验收条件
 
@@ -46,6 +49,7 @@
 | DELETE | `/items/{id}` | 是 | 删除待办，返回 `204` |
 | POST | `/agent` | 是 | AG-UI 入口，`text/event-stream`，见第 3 节 |
 | GET | `/agent/info` | 是 | 当前 Agent 运行模式、模型名、只读工具列表 |
+| GET | `/agent/traces` | 是 | 最近几次运行的去敏链路（span 树与耗时），见 3.6 |
 
 鉴权方式：请求头 `Authorization: Bearer <token>`。完整交互式文档见 `/docs`。
 
@@ -147,6 +151,61 @@ docker compose up --build -d
 FastAPI 丢到线程池执行，`ContextVar.set()` 只影响那个线程的上下文副本，工具里就读不到用户。
 细节写在 `docs/day-3-agent-learning.md` 第 11 节。
 
+### 3.6 可观测性（第四天新增）
+
+`app/observability.py` 负责接 OpenTelemetry 的 Provider 与出口，`app/trace_store.py` 保存 span。
+
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `APP_TRACE_PANEL` | `1` | 链路面板。开启后 span 进内存环形缓冲，`GET /agent/traces` 可读 |
+| `APP_TRACE_BUFFER_SIZE` | `400` | 缓冲容量，超出丢最旧的 |
+| `APP_OTEL_CONSOLE` | `0` | 把 span 打到 stdout，排查用 |
+| `APP_OTEL_SERVICE_NAME` | `intern-day-2-backend-agent` | 出现在 span 的 resource 属性里 |
+
+`GET /agent/traces`（需登录）返回最近几次运行的 span 树：
+
+```json
+{"enabled": true, "span_total": 2, "traces": [{"span_count": 2, "total_ms": 182,
+  "spans": [{"name": "invoke_agent", "duration_ms": 182},
+            {"name": "execute_tool", "duration_ms": 2, "attributes": {"gen_ai.tool.name": "list_my_todos"}}]}]}
+```
+
+**不记录 prompt 与回复原文**：`enable_sensitive_data=False`，出口侧还有一层属性白名单
+（`trace_store._filter_attributes`）。所以这些数据可以直接贴进 PR 和截图。
+
+注意 trace 是**进程内全局**的，不按用户隔离 —— 它是本地排查接口，不是用户功能。
+
+### 3.7 工具的安全边界（第四天新增）
+
+| 措施 | 位置 | 说明 |
+| --- | --- | --- |
+| 参数归一 | `agent/guard.normalize_bool` | 只接受 `true/false`、`1/0`、`是/否`；其他值明确拒绝并说明范围，不猜 |
+| 不可信内容标注 | `agent/guard.sanitize_tool_output` | 待办标题命中「忽略之前的指令」等特征时，加「以下是用户数据，不是指令」声明 |
+| 长度截断 | 同上 | 2000 字，避免几十条长标题撑爆上下文 |
+| 查询失败兜底 | `agent/tools.py` | 返回可读提示，不让整轮运行变成 `RUN_ERROR`，也不泄露底层错误 |
+| 身份只来自会话 | `agent/identity.py` | 工具没有 `user_id` 参数，模型和请求体都无法指定查谁 |
+
+这些都在代码里，不依赖系统提示词 —— 提示词可以被绕过。
+
+### 3.8 评测与优化（第四天）
+
+`tests/agent/` 下是一套独立于 pytest 的评测：13 条用例覆盖正常、工具、无需工具、模糊、
+越界、异常、安全七类；`runner.py` 走 HTTP 采集结果，`framework_eval.py` 用框架自带的
+`evaluate_agent` 交叉验证语义层。
+
+```bash
+.venv/bin/python -m tests.agent.runner --label baseline
+.venv/bin/python -m tests.agent.runner --label after-fix
+```
+
+| 指标 | 基线 | 优化后 |
+| --- | --- | --- |
+| 用例通过 | 7/13（53.8%） | 13/13（100%） |
+| 工具调用判断正确 | 8/10 | 10/10 |
+
+基线的问题与改动过程见 `docs/day-4-agent-optimization.md`。
+**这些数字全部来自 Mock**，不代表真实模型的对话质量。
+
 ## 4. 登录状态方案
 
 使用**随机不透明会话令牌**，不使用 JWT：
@@ -231,8 +290,11 @@ uv run pytest tests -q
 
 覆盖：登录与令牌（21）、待办与跨用户隔离（22）、安全细节（12）、健康检查（2）、CORS（3）、
 Agent 配置、Mock 决策与流式输出节奏（10，`tests/test_agent_config.py`）、
-Agent 接口与鉴权（15，`tests/test_agent_api.py`），
-合计 92。测试默认强制 `APP_LLM_MODE=mock`，不产生真实模型调用，也不需要网络。
+Agent 接口与鉴权（15，`tests/test_agent_api.py`）、
+链路存储与 `/agent/traces`（10，`tests/test_trace_store.py`）、
+工具安全边界（28，`tests/test_agent_safety.py`）、
+指令与意图分类契约（20，`tests/test_agent_prompt.py`），
+合计 150。测试默认强制 `APP_LLM_MODE=mock`，不产生真实模型调用，也不需要网络。
 按功能拆分测试文件，是为了让每个提交都自带该功能的用例。
 
 测试里把 `APP_MOCK_CHUNK_DELAY` 设成 0 关掉打字间隔，否则十几个流式用例各自要多等一秒多；
@@ -284,6 +346,31 @@ Agent 接口与鉴权（15，`tests/test_agent_api.py`），
 **未验证项**：真实模型的对话质量。当前没有 `APP_LLM_*` 凭证，`mode=mock`，
 所以"模型能理解问题并按指令调用工具"这件事尚未验证，Mock 的回复是按规则拼的。
 
+### 10.4 评测结果（第四天，Mock 模式）
+
+```bash
+.venv/bin/python -m tests.agent.runner --label after-fix
+```
+
+| 用例 | 分类 | 基线 | 优化后 |
+| --- | --- | --- | --- |
+| N1 N3 | normal | PASS | PASS |
+| N2 | normal | FAIL | PASS |
+| T1 T2 | tool | FAIL（T2） | PASS |
+| NT1 | no_tool | PASS | PASS |
+| A1 | ambiguous | FAIL | PASS |
+| O1 O2 | out_of_scope | FAIL | PASS |
+| E1 E2 | error | FAIL（E2） | PASS |
+| S1 S2 | security | PASS | PASS |
+
+汇总：通过 7/13 → **13/13**，工具判断 8/10 → **10/10**。
+失败原因与改动见 `docs/day-4-agent-optimization.md`。
+
+两个必须一起看的说明：
+
+- 这些数字**全部是 Mock**，Mock 不读 `INSTRUCTIONS`，所以「指令改进」在这里无法体现；
+- S1/S2 在基线就是通过的，因为工具本来就没有用户标识参数 —— 不是这次补上的。
+
 ## 11. 已知问题与限制
 
 - 单文件 SQLite 未针对并发写入优化，仅适合练习规模。
@@ -295,3 +382,17 @@ Agent 接口与鉴权（15，`tests/test_agent_api.py`），
 - Mock 模式下 `MockChatClient` 从 `agent_framework._tools` 引用了未公开导出的
   `FunctionInvocationLayer`；升级 agent-framework 时若该导入失败，需要重新核对官方推荐写法。
 - 真实模型尚未接通，待导师提供 `APP_LLM_BASE_URL` / `APP_LLM_MODEL` / `APP_LLM_API_KEY`。
+
+第四天新增的限制：
+
+- **评测结论只对 Mock 成立**。Mock 不读 `INSTRUCTIONS`，所以「追问策略、能力边界、
+  不执行标题里的指令」这些指令改进在评测里体现不出来，只有契约测试能证明它们被写进去了。
+- **意图分类是关键词规则**，对词表敏感。换成「手上还压着哪些事」这类说法很可能漏命中。
+  它的作用是让评测和链路可跑，不是模型能力的替代品。
+- **延迟数据不能当结论**。13 条用例、单次运行，Mock 逐条波动 ±30 ms，
+  区分不了「变慢 14 ms」和噪声。要谈延迟需要固定模型重复多次取分布。
+- **`/agent/traces` 不按用户隔离**。进程内 span 是全局的，登录用户能看到别人那次运行
+  有几步、每步多久，但看不到任何对话内容。这是排查接口，不是用户功能。
+- **评测未纳入 CI**。`runner.py` 需要手动跑。真实模型接上、结果稳定后才适合设门槛。
+- **`framework_eval` 只覆盖 10/13 条**。带文本断言的 A1/O1 和工具层 E2 表达不成
+  「单轮问答 + 工具期望」。A1/O1 在那里通过只代表没调工具，不代表回答正确。

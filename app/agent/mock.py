@@ -35,7 +35,7 @@ from agent_framework import (
 )
 from agent_framework._tools import FunctionInvocationLayer
 
-TOOL_NAME = "list_my_todos"
+from app.agent.tools import TOOL_NAME
 
 # 触发工具调用的关键词，只用于让演示可预期
 TODO_KEYWORDS = ("待办", "任务", "清单", "没做", "还没", "todo", "todo")

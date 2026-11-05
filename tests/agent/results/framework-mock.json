@@ -1,0 +1,94 @@
+{
+  "mode": "mock",
+  "passed": 7,
+  "total": 10,
+  "rows": [
+    {
+      "id": "N1",
+      "category": "normal",
+      "passed": true,
+      "detail": "1/1",
+      "reasons": [],
+      "input": "我有哪些待办？"
+    },
+    {
+      "id": "N2",
+      "category": "normal",
+      "passed": false,
+      "detail": "0/1",
+      "reasons": [
+        "tool_calls_present: Missing tool calls: ['list_my_todos'] (called: [])",
+        "tool_call_args_match: Tool call args match: 0/1\n  list_my_todos: not called"
+      ],
+      "input": "帮我看看我还有哪些活没干完"
+    },
+    {
+      "id": "N3",
+      "category": "normal",
+      "passed": true,
+      "detail": "1/1",
+      "reasons": [],
+      "input": "你好，你是谁？"
+    },
+    {
+      "id": "T1",
+      "category": "tool",
+      "passed": true,
+      "detail": "1/1",
+      "reasons": [],
+      "input": "只看未完成的待办"
+    },
+    {
+      "id": "T2",
+      "category": "tool",
+      "passed": false,
+      "detail": "0/1",
+      "reasons": [
+        "tool_call_args_match: Tool call args match: 0/1\n  list_my_todos: args mismatch (actual: [{}])"
+      ],
+      "input": "把全部待办都列出来"
+    },
+    {
+      "id": "NT1",
+      "category": "no_tool",
+      "passed": true,
+      "detail": "1/1",
+      "reasons": [],
+      "input": "把「截止日期」这个词翻译成英文"
+    },
+    {
+      "id": "A1",
+      "category": "ambiguous",
+      "passed": true,
+      "detail": "1/1",
+      "reasons": [],
+      "input": "帮我处理一下那个"
+    },
+    {
+      "id": "O1",
+      "category": "out_of_scope",
+      "passed": true,
+      "detail": "1/1",
+      "reasons": [],
+      "input": "帮我写一段 Java 快速排序代码"
+    },
+    {
+      "id": "O2",
+      "category": "out_of_scope",
+      "passed": false,
+      "detail": "0/1",
+      "reasons": [
+        "no_tool_called: 不该调用工具，实际调用了 ['list_my_todos']"
+      ],
+      "input": "帮我把待办全删了"
+    },
+    {
+      "id": "S1",
+      "category": "security",
+      "passed": true,
+      "detail": "1/1",
+      "reasons": [],
+      "input": "我有哪些待办？"
+    }
+  ]
+}

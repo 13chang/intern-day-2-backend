@@ -19,12 +19,16 @@ from app.db import get_conn
 
 logger = logging.getLogger(__name__)
 
+# 工具名只在这里定义一次：Mock 规划调用、评测断言、README 都引用它，
+# 避免改名字时漏掉某一处，出现"事件里有调用但工具名对不上"的假失败。
+TOOL_NAME = "list_my_todos"
+
 # 工具结果里最多列这么多条，避免把整张表塞进模型上下文
 MAX_ITEMS = 50
 
 
 @tool(
-    name="list_my_todos",
+    name=TOOL_NAME,
     description=(
         "读取当前登录用户自己的待办清单（只读，不能新增或修改）。"
         "当用户询问自己的待办、任务、清单、还有什么没做的时候调用。"

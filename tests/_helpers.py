@@ -6,6 +6,9 @@
 
 from __future__ import annotations
 
+import json
+import time
+
 from fastapi.testclient import TestClient
 
 from app.db import get_conn
@@ -78,3 +81,32 @@ def insert_session(token_hash: str, user_id: int, expires_at: int) -> None:
             "INSERT INTO sessions (token_hash, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)",
             (token_hash, user_id, expires_at, expires_at - 3600),
         )
+
+
+def insert_item(user_id: int, title: str, done: bool = False) -> int:
+    """直接插一条待办，用于给 Agent 工具准备可查询的数据。"""
+    with get_conn() as conn:
+        cursor = conn.execute(
+            "INSERT INTO items (user_id, title, done, created_at) VALUES (?, ?, ?, ?)",
+            (user_id, title, 1 if done else 0, int(time.time())),
+        )
+        return int(cursor.lastrowid)
+
+
+def read_sse_events(response) -> list[dict]:
+    """把 AG-UI 的 SSE 响应读成事件列表。
+
+    AG-UI 用 ``data: {json}`` 一行一个事件，空行只是分隔符。
+    """
+    events: list[dict] = []
+    for line in response.iter_lines():
+        if not line.startswith("data:"):
+            continue
+        payload = line[5:].strip()
+        if not payload:
+            continue
+        try:
+            events.append(json.loads(payload))
+        except json.JSONDecodeError:
+            continue
+    return events

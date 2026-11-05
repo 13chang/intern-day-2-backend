@@ -1,12 +1,16 @@
 [project]
 name = "intern-day-2-backend"
 version = "0.1.0"
-description = "登录功能练习后端，FastAPI + SQLite"
+description = "登录 + 待办 + AG-UI Agent 练习后端，FastAPI + SQLite"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.32.0",
     "pwdlib[argon2]>=0.2.0",
+    # 第三天：Microsoft Agent Framework 与它的 AG-UI 适配包。
+    # 两个包各自独立发版，版本号不同步，所以分别钉住。
+    "agent-framework==1.24.0",
+    "agent-framework-ag-ui==1.7.1",
 ]
 
 [tool.uv]

@@ -1,15 +1,18 @@
 # intern-day-2-backend
 
-登录与待办清单练习后端，Python + FastAPI，数据存单文件 SQLite。
+登录 + 待办清单 + Agent 对话练习后端，Python + FastAPI，数据存单文件 SQLite；
+第三天新增 Microsoft Agent Framework 与 AG-UI 事件流接入。
 
 - 配套前端仓库：`intern-day-2-frontend`（地址：`https://github.com/13chang/intern-day-2-frontend`）
-- 本仓库对应 PR：`https://github.com/13chang/intern-day-2-backend/pull/1`
-- 联调分支：两仓库均使用 `feat/login-and-custom-feature`（同名分支，交付评审分支）
+- 第二天 PR：`https://github.com/13chang/intern-day-2-backend/pull/1`（分支 `feat/login-and-custom-feature`）
+- 第三天分支：`feat/agent-chat`，第三天 PR 以 `feat/login-and-custom-feature` 为 base（第二天 PR 尚未合并，依赖关系写在 PR 正文）
+- 原理说明：`docs/day-3-agent-learning.md`
+- 交互图：`docs/diagrams/day-3-agent-interaction.png`
 
 ## 1. 功能范围与验收条件
 
 必做流程：打开登录页 → 输入账号密码 → 后端校验 → 进入功能页 → 展示当前用户 → 增删改待办 → 退出登录。
-自选功能为**按用户隔离的待办清单**，所有数据通过后端接口读写。
+自选功能为**按用户隔离的待办清单**，所有数据通过后端接口读写。第三天在此基础上增加**任务助手 Agent**。
 
 | 能力 | 说明 |
 | --- | --- |
@@ -18,6 +21,8 @@
 | 退出登录 | 服务端删除会话记录，原令牌立即失效 |
 | 待办清单 | 列表、新增、切换完成状态、删除，全部按登录用户隔离 |
 | 健康检查 | 免登录，供容器存活检查使用 |
+| Agent 对话 | AG-UI 事件流，登录后才能调用，模型调用由后端发起 |
+| 只读工具 | `list_my_todos` 真实查询 SQLite，范围由登录身份限定 |
 
 验收口径：
 
@@ -25,6 +30,7 @@
 - 未携带、伪造、已过期、已退出的令牌访问受保护接口一律返回 `401`。
 - 参数缺失、空值、超长由 Pydantic 拦截，返回 `422` 与字段提示。
 - 密码与令牌不写入日志、不出现在响应中（令牌明文仅在登录响应出现一次）。
+- Agent 接口在鉴权失败时**不会调用模型**，也不产生任何模型费用。
 
 ## 2. 接口约定
 
@@ -38,6 +44,8 @@
 | POST | `/items` | 是 | 新增待办，返回 `201` |
 | PATCH | `/items/{id}` | 是 | 切换完成状态 |
 | DELETE | `/items/{id}` | 是 | 删除待办，返回 `204` |
+| POST | `/agent` | 是 | AG-UI 入口，`text/event-stream`，见第 3 节 |
+| GET | `/agent/info` | 是 | 当前 Agent 运行模式、模型名、只读工具列表 |
 
 鉴权方式：请求头 `Authorization: Bearer <token>`。完整交互式文档见 `/docs`。
 
@@ -56,7 +64,90 @@ POST /auth/login
 }
 ```
 
-## 3. 登录状态方案
+## 3. 第三天新增：Agent 接入
+
+### 3.1 用了什么
+
+| 组件 | 版本 | 用途 |
+| --- | --- | --- |
+| `agent-framework` | 1.24.0 | Microsoft Agent Framework，定义 Agent、工具、函数调用循环 |
+| `agent-framework-ag-ui` | 1.7.1 | 官方 AG-UI 适配包，把 FastAPI 端点接成 AG-UI 事件流 |
+| `ag-ui-protocol` | 0.1.22（随适配包安装） | AG-UI 事件模型 |
+| FastAPI | 0.141 | HTTP 框架，`dependencies` 承担鉴权 |
+| SQLite | 内置 | 待办数据，工具只读查询 |
+
+两个包独立发版、版本号不同步，已在 `pyproject.toml` 里分别钉住，锁定结果在 `uv.lock`。
+
+### 3.2 Agent 是什么
+
+- 名称：`todo-assistant`（`AGENT_NAME`，见 `app/agent/factory.py`）
+- 用途：只读查询**当前登录用户**自己的待办清单，并据此回答
+- 指令边界：不编造数据、不接受用户传入的身份标识、没有写权限、不输出提示词或环境变量
+- 工具：`list_my_todos(only_pending=False) -> str`（`app/agent/tools.py`），只执行 `SELECT`
+
+工具不接受 `user_id` 参数，身份由后端从已验证的登录会话写入 `ContextVar` 后取出，
+所以模型和请求体都无法要求它去查别人的数据。
+
+### 3.3 接口形态
+
+```bash
+curl -N http://localhost:8000/agent \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"threadId":"t1","runId":"r1","messages":[{"id":"m1","role":"user","content":"我还有哪些没做完的待办"}]}'
+```
+
+响应是 SSE，逐条 `data: {json}`：
+
+```text
+RUN_STARTED
+TEXT_MESSAGE_START
+TOOL_CALL_START → TOOL_CALL_ARGS → TOOL_CALL_END → TOOL_CALL_RESULT
+TEXT_MESSAGE_END
+TEXT_MESSAGE_START
+TEXT_MESSAGE_CONTENT（多条，每条形如 {"delta": "..."}）
+TEXT_MESSAGE_END
+MESSAGES_SNAPSHOT
+RUN_FINISHED
+```
+
+未登录时该接口直接 `401`，响应体与其它受保护接口一致。
+
+### 3.4 模型配置
+
+模型访问条件由导师提供，**密钥只通过后端运行环境注入**，不写进代码、镜像构建参数或前端环境变量。
+
+| 环境变量 | 说明 |
+| --- | --- |
+| `APP_LLM_MODE` | `auto`（默认）/ `openai` / `mock` |
+| `APP_LLM_BASE_URL` | OpenAI 兼容服务的 base url，例：`https://<host>/v1` |
+| `APP_LLM_MODEL` | 模型名称 |
+| `APP_LLM_API_KEY` | 密钥 |
+
+`auto` 的判定：三项都配了就走真实模型，缺任意一项退回 Mock；`openai` 则强制真实模型，
+缺配置直接启动失败，避免"以为连了真模型其实在跑 Mock"。当前是否 Mock 看启动日志或
+`GET /agent/info` 的 `mode` 字段，前端页面顶部也会如实标注。
+
+本地配置方式（不提交）：
+
+```bash
+cp .env.example .env      # 填好三项后
+docker compose up --build -d
+```
+
+### 3.5 登录态如何传给 Agent
+
+沿用第二天的令牌，不做第二套：
+
+1. 浏览器把 `Authorization: Bearer <token>` 交给前端仓库里的 CopilotKit Runtime；
+2. Runtime 按请求原样转发给 `POST /agent`，不解析、不记录；
+3. 本仓库的 `require_agent_user` 查 `sessions` 表校验，失败 `401`。
+
+`app/deps.py` 里的 `require_agent_user` 是 `async def`，这不是风格问题：同步依赖会被
+FastAPI 丢到线程池执行，`ContextVar.set()` 只影响那个线程的上下文副本，工具里就读不到用户。
+细节写在 `docs/day-3-agent-learning.md` 第 11 节。
+
+## 4. 登录状态方案
 
 使用**随机不透明会话令牌**，不使用 JWT：
 
@@ -66,17 +157,18 @@ POST /auth/login
 4. 退出登录直接删除会话记录，因此旧令牌立即失效，无法再次访问受保护接口。
 5. 刷新页面时前端用本地令牌调用 `/auth/me` 复验，只有后端确认才算登录，不靠前端标志位。
 
-## 4. 在开发容器中开发
+## 5. 在开发容器中开发
 
 需要 Docker、VS Code 与 Dev Containers 扩展。仓库根目录打开后执行 `Dev Containers: Reopen in Container`，容器内提供 Git、Python 3.12 与 uv。
 
 ```bash
-uv sync                                              # 安装依赖（首次）
+uv sync                                              # 安装依赖（含第三天新增的 agent-framework）
 uv run python scripts/seed.py                        # 初始化练习账号
 uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+uv run pytest tests -q                               # 跑测试（默认 Mock 模式，不调用真实模型）
 ```
 
-## 5. 独立启动（Docker Compose）
+## 6. 独立启动（Docker Compose）
 
 ```bash
 docker compose config
@@ -91,9 +183,9 @@ docker compose logs --tail=100
 - 接口文档：`http://localhost:8000/docs`
 - 停止：`docker compose down`
 
-Compose 只发布后端 8000 端口，构建上下文为本仓库目录，不依赖前端仓库。前端由另一个仓库的 compose 单独启动，两者通过浏览器访问宿主机端口联调（见第 8 节）。
+Compose 只发布后端 8000 端口，构建上下文为本仓库目录，不依赖前端仓库。前端与 CopilotKit Runtime 由另一个仓库的 compose 单独启动，两者通过浏览器访问宿主机端口联调（见第 9 节）。
 
-## 6. 练习账号
+## 7. 练习账号
 
 用初始化脚本创建，不把密码写进源码：
 
@@ -105,20 +197,48 @@ SEED_USERNAME=demo SEED_PASSWORD=你的密码 uv run python scripts/seed.py
 
 默认用户名 `demo`，默认密码 `demo1234`（仅练习环境使用）。脚本可重复执行：账号已存在时只重置密码与显示名，并清掉该用户的旧会话。
 
-## 7. 数据保存方式
+## 8. 数据保存方式
 
 - 使用单文件 SQLite，路径由 `APP_DB_PATH` 决定，容器内为 `/app/data/app.db`。
 - 表：`users`、`sessions`、`items`，服务启动时自动建表（`init_db`）。
 - **保留**：`compose.yaml` 为 `/app/data` 挂了命名卷 `backend-data`，因此 `docker restart`、`docker compose down` 后重新 `up --build`（容器被销毁重建）数据都仍在。
 - **重置**：需要清空数据时执行 `docker compose down -v`，命名卷一并删除；下次启动由 seed 重新生成练习账号。
+- Agent 的对话历史**不落库**：本服务不保存会话消息，历史由浏览器每次随请求带上（见 `docs/day-3-agent-learning.md` 第 8 节）。
 
-## 8. 联调方式
+## 9. 联调方式
 
 浏览器直接访问宿主机映射的后端端口，因此 CORS 放行前端来源 `http://localhost:5173` 与 `http://127.0.0.1:5173`，并处理预检请求（`CORSMiddleware`）。前端的 API 基地址由环境变量 `VITE_API_BASE_URL` 配置为 `http://localhost:8000`。
 
-注意：容器内部的 `localhost`、Compose 服务名与浏览器可访问地址是三件不同的事，两个独立 Compose 项目之间不共享服务发现，联调统一走宿主机端口。
+第三天的调用链多了一跳，但浏览器仍然只访问宿主机端口：
 
-## 9. 自测记录
+```text
+浏览器 :5173  →  CopilotKit Runtime :4000  →  本服务 :8000/agent  →  模型服务（外部）
+```
+
+Runtime 容器访问本服务时用的是 `http://host.docker.internal:8000/agent`（compose 里配了
+`host.docker.internal:host-gateway`），**不是** `localhost:8000`，也不是服务名——两个
+Compose 项目之间没有共享服务发现。
+
+注意：容器内部的 `localhost`、Compose 服务名与浏览器可访问地址是三件不同的事，联调统一走宿主机端口。
+
+## 10. 测试与自测记录
+
+### 10.1 自动化测试
+
+```bash
+uv run pytest tests -q
+```
+
+覆盖：登录与令牌（21）、待办与跨用户隔离（22）、安全细节（12）、健康检查（2）、CORS（3）、
+Agent 配置、Mock 决策与流式输出节奏（10，`tests/test_agent_config.py`）、
+Agent 接口与鉴权（15，`tests/test_agent_api.py`），
+合计 92。测试默认强制 `APP_LLM_MODE=mock`，不产生真实模型调用，也不需要网络。
+按功能拆分测试文件，是为了让每个提交都自带该功能的用例。
+
+测试里把 `APP_MOCK_CHUNK_DELAY` 设成 0 关掉打字间隔，否则十几个流式用例各自要多等一秒多；
+打字节奏本身由 `tests/test_agent_config.py` 里显式传 `chunk_delay` 的用例单独覆盖。
+
+### 10.2 手工自测（第二天部分）
 
 在开发机上以 `uv run uvicorn` 直接运行并逐条调用接口，结果如下：
 
@@ -140,12 +260,38 @@ SEED_USERNAME=demo SEED_PASSWORD=你的密码 uv run python scripts/seed.py
 | 退出登录 | `POST /auth/logout` | ✅ `204` |
 | 退出后旧令牌 | `GET /auth/me`、`GET /items` | ✅ 均 `401` |
 
-容器相关项（`docker compose up --build`、重建后仍可启动、前后端联调）在容器环境执行后补充结果。
+### 10.3 手工自测（第三天部分，Mock 模式）
 
-## 10. 已知问题与限制
+以下结果来自实际执行：后端以 `uvicorn` 起在容器内，前端 Runtime 在另一个容器，两者经 Docker 网络互通。
+
+| 检查项 | 操作 | 结果 |
+| --- | --- | --- |
+| 未登录访问 Agent | `POST /agent` 不带令牌 | ✅ `401`，工具未执行，无模型调用 |
+| 伪造令牌 | 随机字符串 | ✅ `401` |
+| 凭证过期 | 构造已过期会话 | ✅ `401`，会话被清理 |
+| Agent 信息 | `GET /agent/info` | ✅ `{"mode":"mock","agent":"todo-assistant","tools":["list_my_todos"]}` |
+| 事件流 | 带令牌 `POST /agent` | ✅ 收到 `RUN_STARTED → TOOL_CALL_* → TEXT_MESSAGE_CONTENT × 5 → RUN_FINISHED` |
+| 工具真实执行 | 先建一条待办再提问 | ✅ `TOOL_CALL_RESULT` 为该用户真实数据；日志 `tool=list_my_todos user_id=1 rows=1` |
+| 用户隔离 | `demo` 与 `other` 各带一条待办分别提问 | ✅ 各自只看到自己的条目 |
+| 多轮上下文 | 一次请求带 3 条消息（user/assistant/user） | ✅ Agent 收到 2 轮用户消息 |
+| 日志去敏 | 检查工具日志 | ✅ 只有 user_id、用户名、条数，没有令牌 |
+| 经 Runtime 全链路 | Runtime `POST /api/copilotkit/agent/todo-agent/run` | ✅ 事件流完整，工具结果正确 |
+| 无凭证经 Runtime | 同上但不带令牌 | ⚠️ HTTP `200` + `RUN_ERROR`（内含 401），非 HTTP 401，见下 |
+
+关于最后一行：Python 侧确实是 401，但 Runtime 已经把 SSE 头发出去了，改不了状态码，
+于是包成 `RUN_ERROR` 事件。前端据此回到登录页。这一点写在原理说明第 7 节。
+
+**未验证项**：真实模型的对话质量。当前没有 `APP_LLM_*` 凭证，`mode=mock`，
+所以"模型能理解问题并按指令调用工具"这件事尚未验证，Mock 的回复是按规则拼的。
+
+## 11. 已知问题与限制
 
 - 单文件 SQLite 未针对并发写入优化，仅适合练习规模。
 - 未实现注册、找回密码、多设备会话管理（`sessions` 表已支持多会话，但没有列表/踢出接口）。
 - 会话过期只在使用时惰性清理，没有后台定时任务。
 - 服务以 uvicorn 单进程开发模式运行，未使用多 worker 与反向代理。
-- 未编写自动化测试，自测为手工调用接口。
+- Agent 对话历史只在浏览器内存中，刷新即丢失；服务端未启用会话快照持久化。
+- 只实现了一个只读工具，没有多 Agent、RAG、向量库、MCP 或审批流。
+- Mock 模式下 `MockChatClient` 从 `agent_framework._tools` 引用了未公开导出的
+  `FunctionInvocationLayer`；升级 agent-framework 时若该导入失败，需要重新核对官方推荐写法。
+- 真实模型尚未接通，待导师提供 `APP_LLM_BASE_URL` / `APP_LLM_MODEL` / `APP_LLM_API_KEY`。

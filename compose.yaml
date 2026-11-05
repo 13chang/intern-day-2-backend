@@ -21,6 +21,11 @@ services:
       APP_LLM_BASE_URL: "${APP_LLM_BASE_URL:-}"
       APP_LLM_MODEL: "${APP_LLM_MODEL:-}"
       APP_LLM_API_KEY: "${APP_LLM_API_KEY:-}"
+      # 第四天：可观测性。面板默认开，span 只进内存，GET /agent/traces 可读；
+      # 不记录 prompt 与回复原文，所以可以作为 PR 证据直接贴出来。
+      APP_TRACE_PANEL: "${APP_TRACE_PANEL:-1}"
+      APP_TRACE_BUFFER_SIZE: "${APP_TRACE_BUFFER_SIZE:-400}"
+      APP_OTEL_CONSOLE: "${APP_OTEL_CONSOLE:-0}"
     # 启动前初始化练习账号；脚本可重复执行，只会重置该账号
     command: sh -c "python scripts/seed.py && uvicorn app.main:app --host 0.0.0.0 --port 8000"
     # 数据卷：容器重建后数据库文件仍在；彻底重置用 docker compose down -v

@@ -14,6 +14,13 @@ services:
       SEED_USERNAME: "${SEED_USERNAME:-demo}"
       SEED_PASSWORD: "${SEED_PASSWORD:-demo1234}"
       SEED_DISPLAY_NAME: "${SEED_DISPLAY_NAME:-练习用户}"
+      # 第三天：模型访问条件。密钥只从运行环境注入，
+      # 不写进代码、不写进镜像构建参数、不暴露给前端。
+      # 三项都为空的默认行为是 auto → Mock 模式。
+      APP_LLM_MODE: "${APP_LLM_MODE:-auto}"
+      APP_LLM_BASE_URL: "${APP_LLM_BASE_URL:-}"
+      APP_LLM_MODEL: "${APP_LLM_MODEL:-}"
+      APP_LLM_API_KEY: "${APP_LLM_API_KEY:-}"
     # 启动前初始化练习账号；脚本可重复执行，只会重置该账号
     command: sh -c "python scripts/seed.py && uvicorn app.main:app --host 0.0.0.0 --port 8000"
     # 数据卷：容器重建后数据库文件仍在；彻底重置用 docker compose down -v

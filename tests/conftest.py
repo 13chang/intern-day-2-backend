@@ -9,12 +9,18 @@
 
 from __future__ import annotations
 
+import os
+
 from typing import Any, Iterator
 
 import pytest
 from fastapi.testclient import TestClient
 
-from app.main import app
+# Agent 端点在 app 导入时就会构建，所以必须在导入 app.main 之前定死模式：
+# 即使开发机环境里配了真实模型密钥，测试也只用 Mock，不产生任何模型调用费用。
+os.environ["APP_LLM_MODE"] = "mock"
+
+from app.main import app  # noqa: E402  (必须在设置环境变量之后导入)
 from tests._helpers import (
     DEMO_DISPLAY_NAME,
     DEMO_PASSWORD,

@@ -10,7 +10,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.db import init_db
-from app.routers import auth, items
+from app.routers import agent, auth, items
 
 DEFAULT_CORS_ORIGINS = "http://localhost:5173,http://127.0.0.1:5173"
 
@@ -29,8 +29,11 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(
     title="Intern Day 2 Backend",
-    version="0.1.0",
-    description="登录 + 待办清单练习后端：会话令牌鉴权，SQLite 存储。",
+    version="0.2.0",
+    description=(
+        "登录 + 待办清单练习后端：会话令牌鉴权，SQLite 存储。"
+        "第三天新增 Agent：Microsoft Agent Framework + AG-UI 事件流。"
+    ),
     lifespan=lifespan,
 )
 
@@ -45,6 +48,9 @@ app.add_middleware(
 
 app.include_router(auth.router)
 app.include_router(items.router)
+app.include_router(agent.router)
+# AG-UI 端点由官方适配函数注册，必须在 app 建好之后、启动之前挂上
+agent.install_agent_endpoint(app)
 
 
 @app.get("/health", tags=["meta"], summary="健康检查")

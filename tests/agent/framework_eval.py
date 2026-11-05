@@ -156,6 +156,16 @@ async def run_case(agent: Any, case: dict[str, Any]) -> dict[str, Any]:
 
 
 async def main() -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="用框架自带评测 API 跑用例")
+    parser.add_argument(
+        "--label",
+        default="baseline",
+        help="结果标签，如 baseline / after-fix；不区分标签会覆盖基线，踩过这个坑",
+    )
+    args = parser.parse_args()
+
     prepare_environment()
 
     from app.agent.config import load_llm_settings
@@ -196,11 +206,12 @@ async def main() -> int:
     print(f"\n通过 {passed}/{total}（{passed / total * 100:.1f}%）" if total else "\n没有可跑的用例")
 
     RESULTS_DIR.mkdir(exist_ok=True)
-    payload = {"mode": mode, "passed": passed, "total": total, "rows": rows}
-    (RESULTS_DIR / f"framework-{mode}.json").write_text(
+    payload = {"label": args.label, "mode": mode, "passed": passed, "total": total, "rows": rows}
+    stem = f"framework-{args.label}-{mode}"
+    (RESULTS_DIR / f"{stem}.json").write_text(
         json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    print(f"结果已写入 tests/agent/results/framework-{mode}.json")
+    print(f"结果已写入 tests/agent/results/{stem}.json")
     return 0 if passed == total else 1
 
 

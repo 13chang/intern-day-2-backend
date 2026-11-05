@@ -230,9 +230,13 @@ uv run pytest tests -q
 ```
 
 覆盖：登录与令牌（21）、待办与跨用户隔离（22）、安全细节（12）、健康检查（2）、CORS（3）、
-Agent 配置与 Mock 客户端（6，`tests/test_agent_config.py`）、Agent 接口与鉴权（15，`tests/test_agent_api.py`），
-合计 87。测试默认强制 `APP_LLM_MODE=mock`，不产生真实模型调用，也不需要网络。
+Agent 配置、Mock 决策与流式输出节奏（10，`tests/test_agent_config.py`）、
+Agent 接口与鉴权（15，`tests/test_agent_api.py`），
+合计 92。测试默认强制 `APP_LLM_MODE=mock`，不产生真实模型调用，也不需要网络。
 按功能拆分测试文件，是为了让每个提交都自带该功能的用例。
+
+测试里把 `APP_MOCK_CHUNK_DELAY` 设成 0 关掉打字间隔，否则十几个流式用例各自要多等一秒多；
+打字节奏本身由 `tests/test_agent_config.py` 里显式传 `chunk_delay` 的用例单独覆盖。
 
 ### 10.2 手工自测（第二天部分）
 

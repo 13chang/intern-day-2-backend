@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from collections.abc import Sequence
 from typing import Any
@@ -42,13 +43,45 @@ PENDING_KEYWORDS = ("未完成", "没完成", "没做", "还没")
 
 MOCK_BANNER = "（Mock 模式：未连接真实模型，以下内容由本地规则生成）"
 
+# 一次吐多少字、两条之间停多久（秒）。
+# 真实模型是一边算一边吐 token，天然有间隔；Mock 如果一口气 yield 完，
+# 整段文字会在同一个事件循环 tick 内推完，SSE 几毫秒就结束，
+# 浏览器只重绘一次 —— 看起来就是「瞬间出现整段」，没有打字效果。
+# 所以这里显式按打字速度铺开：2 字 / 50ms ≈ 40 字每秒。
+DEFAULT_CHUNK_SIZE = 2
+DEFAULT_CHUNK_DELAY_SECONDS = 0.05
+
+# 一条回复最多铺多少秒。工具返回几十条待办时文本会很长，
+# 按固定节奏要等十几秒，所以超长回复按比例压缩间隔，
+# 保证「短回复像打字、长回复不磨人」。
+MAX_STREAM_SECONDS = 6.0
+
 
 class MockChatClient(FunctionInvocationLayer, BaseChatClient):
-    """按规则应答的假模型，接口和真实 chat client 一致。"""
+    """按规则应答的假模型，接口和真实 chat client 一致。
 
-    def __init__(self) -> None:
+    ``chunk_delay`` 用来控制流式输出的节奏：默认按打字速度铺开，
+    测试里传 0 可以关掉等待，避免用例被几十次 50ms 拖慢。
+    """
+
+    def __init__(
+        self,
+        *,
+        chunk_size: int = DEFAULT_CHUNK_SIZE,
+        chunk_delay: float | None = None,
+    ) -> None:
         # FunctionInvocationLayer.__init__ 会接着调用 BaseChatClient.__init__
         super().__init__()
+        self._chunk_size = max(1, chunk_size)
+        self._chunk_delay = (
+            DEFAULT_CHUNK_DELAY_SECONDS if chunk_delay is None else max(0.0, chunk_delay)
+        )
+
+    def _effective_delay(self, piece_count: int) -> float:
+        """按块数算实际间隔：固定节奏，但整条流不超过 MAX_STREAM_SECONDS。"""
+        if not self._chunk_delay or piece_count < 2:
+            return 0.0
+        return min(self._chunk_delay, MAX_STREAM_SECONDS / (piece_count - 1))
 
     # ------------------------------------------------------------------ 内部
 
@@ -118,8 +151,8 @@ class MockChatClient(FunctionInvocationLayer, BaseChatClient):
             "问「我的待办有哪些」可以看到一次真实的后端工具调用。",
         )
 
-    @staticmethod
-    def _chunks(text: str, size: int = 18) -> list[str]:
+    def _chunks(self, text: str) -> list[str]:
+        size = self._chunk_size
         return [text[i : i + size] for i in range(0, len(text), size)] or [""]
 
     async def _inner_get_response(
@@ -161,9 +194,14 @@ class MockChatClient(FunctionInvocationLayer, BaseChatClient):
             )
 
         pieces = self._chunks(text)
+        delay = self._effective_delay(len(pieces))
 
         async def text_updates():
             for index, piece in enumerate(pieces):
+                # 第一块立即给出去，后面每块之间等一会儿；
+                # 这个 await 是打字效果的来源，去掉就退化成「一次全出」。
+                if index and delay:
+                    await asyncio.sleep(delay)
                 yield ChatResponseUpdate(
                     contents=[Content.from_text(piece)],
                     role="assistant",

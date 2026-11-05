@@ -7,6 +7,8 @@ Agent 只在这里创建一次，``add_agent_framework_fastapi_endpoint`` 注册
 
 from __future__ import annotations
 
+import os
+
 from agent_framework import Agent
 
 from app.agent.config import LlmSettings, load_llm_settings
@@ -30,12 +32,28 @@ INSTRUCTIONS = """你是「待办清单」练习项目里的个人任务助手�
 """
 
 
+def _mock_chunk_delay() -> float | None:
+    """Mock 流式输出的打字间隔（秒）。
+
+    不设就用 ``mock.DEFAULT_CHUNK_DELAY_SECONDS``；设成 0 关掉等待，
+    测试用这个开关，避免几十次 25ms 把用例拖慢。
+    """
+    raw = os.environ.get("APP_MOCK_CHUNK_DELAY", "").strip()
+    if not raw:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        # 值写错了不影响可用性，退回默认节奏
+        return None
+
+
 def build_agent(settings: LlmSettings | None = None) -> Agent:
     """按当前环境配置构造 Agent。"""
     resolved = settings or load_llm_settings()
 
     if resolved.is_mock:
-        client = MockChatClient()
+        client = MockChatClient(chunk_delay=_mock_chunk_delay())
     else:
         # 放在分支里导入：Mock 场景不需要加载 openai 相关依赖
         from agent_framework.openai import OpenAIChatCompletionClient

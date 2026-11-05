@@ -141,7 +141,9 @@ def main() -> int:
     summary = summarize(results, cases, mode)
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    stem = f"{args.label}-{mode}"
+    # --only 时换个文件名：调试单条用例不应该覆盖整批基线，
+    # 这个坑踩过一次（一条 E2 把 13 条的基线结果盖掉了）。
+    stem = f"{args.label}-{mode}" + (f"-only-{args.only}" if args.only else "")
     payload = {"summary": summary, "results": [result.to_dict() for result in results]}
     (RESULTS_DIR / f"{stem}.json").write_text(
         json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"

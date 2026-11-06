@@ -3,8 +3,12 @@
 > 基于第三天的 Agent（Microsoft Agent Framework + AG-UI + CopilotKit）建立评测基线，
 > 诊断问题、做针对性优化，再用同一批用例复测。
 >
-> 运行模式：**Mock**。没有模型凭证，所有结论只代表 Mock 规则下的行为，
-> 不代表真实模型的对话质量。文档里每处都标了这一点，请勿混读。
+> 基线 → 诊断 → 优化 → 复测这一整轮是在 **Mock** 下完成的，
+> 结论只对 Mock 规则成立。
+>
+> 后来拿到了 DeepSeek 凭证，在**优化后的代码**上用同一批 13 条用例补跑了真实模型评测
+> （连续 3 轮），结果写在第 9 节。真实模型**没有优化前的基线**，
+> 所以不能声称「优化让真实模型提高了多少」；能确认的是「链路通了、指令生效了」。
 
 ---
 
@@ -54,7 +58,8 @@ pytest 验的是「代码在已知输入下的确定性行为」，必须全绿�
 | 计时点 | 首个 `TEXT_MESSAGE_CONTENT`（首字）、整个运行结束（总耗时） |
 
 模型有随机性，但 **Mock 没有**：同一份代码、同一批数据，结果可逐条复现。
-这也是本轮结论的边界 —— 换成真实模型，同一批用例可能会飘。
+真实模型后来重复跑了 3 轮（见第 9 节），三轮都 13/13，但仍不能把「没观察到波动」
+当成「不会波动」—— 用例数少、检查项偏客观，主观质量并未覆盖。
 
 ---
 
@@ -230,11 +235,12 @@ pytest 验的是「代码在已知输入下的确定性行为」，必须全绿�
 
 ## 6. 限制与未解决问题
 
-1. **全部结论只对 Mock 成立**。真实模型是否稳定调用工具、能否遵守追问与边界指令，
-   完全没有验证。这是本次最大的缺口，也是拿到凭证后第一件要做的事。
-2. **意图分类是关键词规则**。它对词表敏感：「活没干完」能命中是因为特意加了
-   `没干完`；换个说法（「手上还压着哪些事」）很可能又漏。这不是模型能力的替代品，
-   只够把链路和评测跑通。
+1. **前后对比只在 Mock 下成立**。真实模型是优化后才接通的，没有优化前的基线
+   （见第 9 节），所以「优化让真实模型提高了多少」无法回答。这是本次最大的缺口。
+   要补的话，需要在优化前的提交上用同一批用例跑一次真实模型基线。
+2. **意图分类是关键词规则，只作用于 Mock**。它对词表敏感：「活没干完」能命中是因为
+   特意加了 `没干完`；换个说法（「手上还压着哪些事」）很可能又漏。
+   真实模型不看这套词表，靠 `INSTRUCTIONS`。两套结果要分开看。
 3. **延迟数据只能内部对比**。13 条用例、单次运行，量级太小区分不了噪声。
    要谈延迟，需要固定模型重复多次取分布。
 4. **`framework_eval` 只覆盖 10 条**。带文本断言的 A1/O1 和工具层 E2 表达不成
@@ -269,8 +275,11 @@ uv sync
 # 5. 观测链路
 .venv/bin/python -m tests.agent.trace_demo
 
-# 6. 用真实模型跑（需 .env 配好三项凭证）
-EVAL_MODE=real .venv/bin/python -m tests.agent.runner --label baseline
+# 6. 用真实模型跑（.env 里 MODEL_MODE=real 且 OPENAI_* 三项齐全）
+#    凭证由评测脚本从 .env 白名单补进环境，不需要手工 export
+EVAL_MODE=real .venv/bin/python -m tests.agent.runner --label after-fix
+EVAL_MODE=real .venv/bin/python -m tests.agent.framework_eval --label after-fix
+EVAL_MODE=real .venv/bin/python -m tests.agent.trace_demo
 ```
 
 结果文件：`tests/agent/results/`，`{label}-{mode}` 命名，Mock 与真实模型不会混在一起。
@@ -284,9 +293,93 @@ EVAL_MODE=real .venv/bin/python -m tests.agent.runner --label baseline
 后者尤其重要：O2 基线不但没拒绝，还把用户的完整待办列表贴了出来，
 而用户要的是删除。这不是回答不好，是行为不对。
 
-**一个没解决的问题**：真实模型的行为完全没有数据。
-所有「追问、边界、不执行标题里的指令」都只是写进了指令，Mock 跑不出效果。
+**一个仍未解决的问题**：现在有真实模型的数据了（第 9 节，三轮 13/13），
+但**没有优化前的真实模型基线**，所以「这次优化对真实模型到底带来多大提升」依然答不上来。
+要补就得回到优化前的提交，用同一批用例、同一模型再跑一次。
 
 **一次没达预期的经历**：先改指令、复测分数不动（见 3.4）。
 教训是——在 Mock 模式里，能验证的是「规则」和「契约」，不是「指令的效果」。
 把这两件事分清楚，比多改几条提示词有用。
+
+---
+
+## 9. 补充：真实模型验证（DeepSeek）
+
+优化完成后拿到了模型凭证，用 `.env` 的 `MODEL_MODE=real` 接上 DeepSeek
+（`deepseek-chat`，`https://api.deepseek.com/v1`），在**同一批 13 条用例**上跑了三次。
+
+### 9.1 结果
+
+| 轮次 | 通过 | 工具判断正确 | 总耗时均值 | 首字均值 |
+| --- | --- | --- | --- | --- |
+| after-fix | 13/13 | 10/10 | 1271 ms | 1271 ms |
+| repeat-1 | 13/13 | 10/10 | 1291 ms | 1291 ms |
+| repeat-2 | 13/13 | 10/10 | 1469 ms | 1468 ms |
+
+固定条件：`temperature=0.2`、`max_tokens=800`、同一份虚构数据、同一批用例。
+三轮全过，说明不是单次波动。框架原生评测 `framework-after-fix-real.json` 为 **10/10**。
+
+结果文件：`after-fix-real.{json,md}`、`repeat-1-real.{json,md}`、`repeat-2-real.{json,md}`、
+`framework-after-fix-real.json`、`trace-real.json`。
+
+### 9.2 链路是真的
+
+```text
+invoke_agent todo-assistant  1723ms
+  ├ chat deepseek-chat   761ms   ← 第一次模型调用，决定调工具
+  ├ execute_tool list_my_todos  1ms
+  └ chat deepseek-chat   957ms   ← 带工具结果再问一次
+```
+
+四个 span 说明工具调用循环真的走了两轮模型，不是 Mock 拼出来的。
+`trace_demo.py` 的三条断言（至少 2 个 span、工具名正确、属性无对话原文）全部通过。
+
+N1 的真实回复（节选）：
+
+```text
+你一共有 3 条待办，其中 2 条还没完成：
+1. 复习 AG-UI 事件类型（未完成）
+2. 整理第三天的交互图（未完成）
+3. 提交第二天的作业（已完成）
+需要我只看未完成的那两条吗？
+```
+
+这和 3.2 节改的「先用一句话给结论，再列条目」的结构要求一致 ——
+**`INSTRUCTIONS` 在真实模型上确实生效了**，这是 Mock 阶段无法验证的部分。
+
+### 9.3 能得出什么、不能得出什么
+
+**能确认**：
+
+- DeepSeek 的 OpenAI 兼容链路可跑，`OpenAIChatCompletionClient`（`/chat/completions`）
+  第二轮工具结果回传正常，没有出现 `400 No tool call found for tool output`；
+- 追问（A1）、边界（O1/O2）、参数（T1/T2）、注入（S2）这些约束在真实模型上都通过了；
+- 三轮稳定，评测集没有把「碰巧答对」当成通过。
+
+**不能确认**：
+
+- **没有优化前的真实模型基线**（当时没凭证），所以无法量化"优化让真实模型提高了多少"。
+  第 4 节的前后对比只在 Mock 下成立；
+- 只在 `deepseek-chat` 一家一个模型上验证过，换服务商或模型要重跑；
+- 评测检查项仍偏客观事实（是否调工具、是否含正确数据、是否越界），
+  没有评估回答的自然度、简洁度这类主观质量。
+
+同代码下 Mock 与真实模型的对比是有意义的：结论一致（都 13/13），
+但真实模型约 1.3s、Mock 约 0.14s，差的是模型推理而不是链路开销。
+
+### 9.4 复现
+
+```bash
+# .env 里 MODEL_MODE=real，并填好 OPENAI_* 三项（.env 不提交）
+EVAL_MODE=real .venv/bin/python -m tests.agent.runner --label after-fix
+EVAL_MODE=real .venv/bin/python -m tests.agent.runner --label repeat-1
+EVAL_MODE=real .venv/bin/python -m tests.agent.runner --label repeat-2
+EVAL_MODE=real .venv/bin/python -m tests.agent.framework_eval --label after-fix
+EVAL_MODE=real .venv/bin/python -m tests.agent.trace_demo
+
+# 切回 Mock 只需把 .env 的 MODEL_MODE 改成 mock，代码不用动
+```
+
+`EVAL_MODE=real` 时评测脚本会从 `.env` 白名单里补凭证（不读 `MODEL_MODE`），
+避免为了跑评测额外装依赖或手工 export 一堆变量。
+

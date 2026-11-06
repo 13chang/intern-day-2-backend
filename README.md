@@ -117,27 +117,44 @@ RUN_FINISHED
 
 未登录时该接口直接 `401`，响应体与其它受保护接口一致。
 
-### 3.4 模型配置
+### 3.4 模型配置：一个开关切换 Mock / 真实模型
 
-模型访问条件由导师提供，**密钥只通过后端运行环境注入**，不写进代码、镜像构建参数或前端环境变量。
+**密钥只通过后端运行环境注入**，不写进代码、镜像构建参数、`.env.example` 或前端环境变量。
+`.env` 已被 `.gitignore` 忽略。
 
 | 环境变量 | 说明 |
 | --- | --- |
-| `APP_LLM_MODE` | `auto`（默认）/ `openai` / `mock` |
-| `APP_LLM_BASE_URL` | OpenAI 兼容服务的 base url，例：`https://<host>/v1` |
-| `APP_LLM_MODEL` | 模型名称 |
-| `APP_LLM_API_KEY` | 密钥 |
+| `MODEL_MODE` | `mock` / `real` / `auto`。**改这一行就能切换，代码不用动** |
+| `OPENAI_API_KEY` | 密钥（真实 key 只放 `.env`） |
+| `OPENAI_BASE_URL` | OpenAI 兼容服务地址，DeepSeek 是 `https://api.deepseek.com/v1` |
+| `OPENAI_MODEL` | 模型名，例如 `deepseek-chat` |
 
-`auto` 的判定：三项都配了就走真实模型，缺任意一项退回 Mock；`openai` 则强制真实模型，
-缺配置直接启动失败，避免"以为连了真模型其实在跑 Mock"。当前是否 Mock 看启动日志或
-`GET /agent/info` 的 `mode` 字段，前端页面顶部也会如实标注。
+`real` = 调用真实模型，缺任意一项凭证**启动直接失败**（避免"以为连了真模型其实在跑 Mock"）；
+`mock` = 本地假模型，不联网、零成本，但 Agent 循环、工具执行、AG-UI 事件流都是真的；
+`auto` = 三项都配了走真实模型，否则退回 Mock。
 
-本地配置方式（不提交）：
+`APP_LLM_MODE` / `APP_LLM_*` 是第三天的旧变量名，仍然兼容；两个开关同时设置时
+`MODEL_MODE` 优先，同名凭证 `APP_LLM_*` 优先。
+
+本地配置（`.env` 不提交）：
 
 ```bash
-cp .env.example .env      # 填好三项后
+cp .env.example .env
+# 把 MODEL_MODE 改成 real，并填好 OPENAI_* 三项
 docker compose up --build -d
+# 想切回 Mock：把 .env 的 MODEL_MODE 改成 mock，再重启容器即可
 ```
+
+当前是哪种模式，看启动日志、`GET /agent/info` 的 `mode` 字段，或前端页面顶部的标注。
+
+**为什么必须用 `OpenAIChatCompletionClient`**：它打 `/chat/completions`。
+同包里的 `OpenAIChatClient` 打的是 `/responses`（OpenAI Responses API），
+DeepSeek 的兼容层不认 Responses 协议里的工具结果结构，第二轮会报
+`400 "No tool call found for tool output with call_id=..."` —— 第一轮工具调用正常，
+把工具结果回传时才炸，很容易误判成框架问题。接国产 OpenAI 兼容服务一律用前者。
+
+实测（第四天补充，DeepSeek `deepseek-chat`）：13 条评测用例连续 3 轮全部通过，
+一次运行的 span 树是 `chat → execute_tool → chat`，说明工具调用循环真的走了两轮模型。
 
 ### 3.5 登录态如何传给 Agent
 
@@ -294,7 +311,8 @@ Agent 接口与鉴权（15，`tests/test_agent_api.py`）、
 链路存储与 `/agent/traces`（10，`tests/test_trace_store.py`）、
 工具安全边界（28，`tests/test_agent_safety.py`）、
 指令与意图分类契约（20，`tests/test_agent_prompt.py`），
-合计 150。测试默认强制 `APP_LLM_MODE=mock`，不产生真实模型调用，也不需要网络。
+合计 157。测试同时强制 `MODEL_MODE=mock` 与 `APP_LLM_MODE=mock`，
+不产生真实模型调用，也不需要网络（连不连得上 DeepSeek 都不影响单元测试）。
 按功能拆分测试文件，是为了让每个提交都自带该功能的用例。
 
 测试里把 `APP_MOCK_CHUNK_DELAY` 设成 0 关掉打字间隔，否则十几个流式用例各自要多等一秒多；
@@ -343,8 +361,8 @@ Agent 接口与鉴权（15，`tests/test_agent_api.py`）、
 关于最后一行：Python 侧确实是 401，但 Runtime 已经把 SSE 头发出去了，改不了状态码，
 于是包成 `RUN_ERROR` 事件。前端据此回到登录页。这一点写在原理说明第 7 节。
 
-**未验证项**：真实模型的对话质量。当前没有 `APP_LLM_*` 凭证，`mode=mock`，
-所以"模型能理解问题并按指令调用工具"这件事尚未验证，Mock 的回复是按规则拼的。
+**补充（第四天）**：真实模型已经接通并跑过评测，结论见 10.5。
+上面这一节记录的是第三天当时只有 Mock 的状态，保留原样作为历史。
 
 ### 10.4 评测结果（第四天，Mock 模式）
 
@@ -371,6 +389,43 @@ Agent 接口与鉴权（15，`tests/test_agent_api.py`）、
 - 这些数字**全部是 Mock**，Mock 不读 `INSTRUCTIONS`，所以「指令改进」在这里无法体现；
 - S1/S2 在基线就是通过的，因为工具本来就没有用户标识参数 —— 不是这次补上的。
 
+### 10.5 真实模型评测（第四天补充，DeepSeek）
+
+凭证到位后，把 `.env` 的 `MODEL_MODE` 改成 `real`，用**同一批 13 条用例**跑了三次：
+
+```bash
+EVAL_MODE=real .venv/bin/python -m tests.agent.runner --label after-fix
+EVAL_MODE=real .venv/bin/python -m tests.agent.runner --label repeat-1
+EVAL_MODE=real .venv/bin/python -m tests.agent.runner --label repeat-2
+```
+
+| 轮次 | 通过 | 工具判断正确 | 总耗时均值 |
+| --- | --- | --- | --- |
+| after-fix | 13/13 | 10/10 | 1271 ms |
+| repeat-1 | 13/13 | 10/10 | 1291 ms |
+| repeat-2 | 13/13 | 10/10 | 1469 ms |
+
+固定条件：`deepseek-chat`、`https://api.deepseek.com/v1`、`temperature=0.2`、
+同一份虚构数据、同一批用例。三轮全过，说明这次不是单次波动。
+
+框架原生评测 `framework-after-fix-real.json`：**10/10**。
+链路观测 `trace-real.json` 抓到的 span 树：
+
+```text
+invoke_agent todo-assistant  1723ms
+  ├ chat deepseek-chat   761ms   ← 第一次模型调用（决定调工具）
+  ├ execute_tool list_my_todos  1ms
+  └ chat deepseek-chat   957ms   ← 带工具结果再问一次
+```
+
+这条链路说明工具循环是真实的两轮模型调用，不是 Mock 里拼出来的。
+
+**一个必须说清的限制**：真实模型是在**优化后的代码**上首次跑通的，
+优化前没有凭证，因此**没有同配置的真实模型基线**。
+第 10.4 节的前后对比只在 Mock 下成立；这里能对比的是「同代码下 Mock vs 真实模型」：
+结论一致（都 13/13），但真实模型总耗时约 1.3s，Mock 约 0.14s —— 差的是模型推理，
+不是链路开销。
+
 ## 11. 已知问题与限制
 
 - 单文件 SQLite 未针对并发写入优化，仅适合练习规模。
@@ -381,18 +436,24 @@ Agent 接口与鉴权（15，`tests/test_agent_api.py`）、
 - 只实现了一个只读工具，没有多 Agent、RAG、向量库、MCP 或审批流。
 - Mock 模式下 `MockChatClient` 从 `agent_framework._tools` 引用了未公开导出的
   `FunctionInvocationLayer`；升级 agent-framework 时若该导入失败，需要重新核对官方推荐写法。
-- 真实模型尚未接通，待导师提供 `APP_LLM_BASE_URL` / `APP_LLM_MODEL` / `APP_LLM_API_KEY`。
+- 真实模型已接通（DeepSeek `deepseek-chat`，见 10.5），但**只在这一家、这一个模型上验证过**；
+  换服务商或模型后要重跑评测，尤其是工具调用的第二轮（`/chat/completions` 兼容性）。
+  密钥只在 `.env`，未写进任何被提交的文件。
 
 第四天新增的限制：
 
-- **评测结论只对 Mock 成立**。Mock 不读 `INSTRUCTIONS`，所以「追问策略、能力边界、
-  不执行标题里的指令」这些指令改进在评测里体现不出来，只有契约测试能证明它们被写进去了。
-- **意图分类是关键词规则**，对词表敏感。换成「手上还压着哪些事」这类说法很可能漏命中。
-  它的作用是让评测和链路可跑，不是模型能力的替代品。
-- **延迟数据不能当结论**。13 条用例、单次运行，Mock 逐条波动 ±30 ms，
-  区分不了「变慢 14 ms」和噪声。要谈延迟需要固定模型重复多次取分布。
+- **前后对比只在 Mock 下成立**。真实模型是优化后才有凭证的，没有同配置的优化前基线
+  （见 10.5），不能声称「优化让真实模型提高了多少」。Mock 不读 `INSTRUCTIONS`，
+  所以「追问策略、能力边界、不执行标题里的指令」这些指令改进在 Mock 评测里体现不出来；
+  现在能在真实模型评测里看到它们生效，但仍缺「改之前」的对照。
+- **意图分类是关键词规则，只作用于 Mock**。真实模型不看这套词表，靠 `INSTRUCTIONS`。
+  换成「手上还压着哪些事」这类说法，Mock 很可能漏命中；真实模型反而可能理解。
+  所以两套结果要分开看，不能说「意图分类让真实模型变好了」。
+- **延迟数据分两种**：Mock 13 条单次运行、波动 ±30 ms，区分不了「变慢 14 ms」和噪声；
+  真实模型重复 3 轮（1271 / 1291 / 1469 ms），能看出推理耗时但仍有波动，
+  都没有做统计意义上的显著性判断。
 - **`/agent/traces` 不按用户隔离**。进程内 span 是全局的，登录用户能看到别人那次运行
   有几步、每步多久，但看不到任何对话内容。这是排查接口，不是用户功能。
-- **评测未纳入 CI**。`runner.py` 需要手动跑。真实模型接上、结果稳定后才适合设门槛。
+- **评测未纳入 CI**。`runner.py` 需要手动跑，真实模型评测会产生费用，不适合每次提交都跑。
 - **`framework_eval` 只覆盖 10/13 条**。带文本断言的 A1/O1 和工具层 E2 表达不成
   「单轮问答 + 工具期望」。A1/O1 在那里通过只代表没调工具，不代表回答正确。

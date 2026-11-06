@@ -1,0 +1,83 @@
+{
+  "mode": "real",
+  "trace": {
+    "trace_id": "8ebe8daa5a67fb0a642f5dea89eb71ea",
+    "span_count": 4,
+    "started_ms": 0,
+    "total_ms": 1723,
+    "finished_ns": 1793873288033422266,
+    "spans": [
+      {
+        "name": "invoke_agent todo-assistant",
+        "span_id": "0718d5f7877e48ae",
+        "parent_id": null,
+        "duration_ms": 1723,
+        "attributes": {
+          "gen_ai.operation.name": "invoke_agent",
+          "gen_ai.agent.name": "todo-assistant",
+          "gen_ai.request.model": "deepseek-chat",
+          "gen_ai.usage.input_tokens": 1650,
+          "gen_ai.usage.output_tokens": 87,
+          "gen_ai.usage.cache_read.input_tokens": 1152
+        },
+        "status": "UNSET"
+      },
+      {
+        "name": "chat deepseek-chat",
+        "span_id": "b10153d70a9a3816",
+        "parent_id": "0718d5f7877e48ae",
+        "duration_ms": 761,
+        "attributes": {
+          "gen_ai.operation.name": "chat",
+          "gen_ai.request.model": "deepseek-chat",
+          "gen_ai.usage.input_tokens": 776,
+          "gen_ai.usage.output_tokens": 42,
+          "gen_ai.usage.cache_read.input_tokens": 512
+        },
+        "status": "UNSET"
+      },
+      {
+        "name": "execute_tool list_my_todos",
+        "span_id": "18968f2f600a199a",
+        "parent_id": "0718d5f7877e48ae",
+        "duration_ms": 1,
+        "attributes": {
+          "gen_ai.operation.name": "execute_tool",
+          "gen_ai.tool.name": "list_my_todos"
+        },
+        "status": "UNSET"
+      },
+      {
+        "name": "chat deepseek-chat",
+        "span_id": "134a5223f65a658c",
+        "parent_id": "0718d5f7877e48ae",
+        "duration_ms": 957,
+        "attributes": {
+          "gen_ai.operation.name": "chat",
+          "gen_ai.request.model": "deepseek-chat",
+          "gen_ai.usage.input_tokens": 874,
+          "gen_ai.usage.output_tokens": 45,
+          "gen_ai.usage.cache_read.input_tokens": 640
+        },
+        "status": "UNSET"
+      }
+    ]
+  },
+  "checks": [
+    {
+      "name": "至少 2 个 span（Agent + 工具）",
+      "passed": true,
+      "detail": "实际 4：['invoke_agent todo-assistant', 'chat deepseek-chat', 'execute_tool list_my_todos', 'chat deepseek-chat']"
+    },
+    {
+      "name": "存在 execute_tool 且工具名正确",
+      "passed": true,
+      "detail": "实际 [{gen_ai.operation.name: 'execute_tool', gen_ai.tool.name: 'list_my_todos'}]"
+    },
+    {
+      "name": "属性里没有对话原文",
+      "passed": true,
+      "detail": "[{\"gen_ai.operation.name\": \"invoke_agent\", \"gen_ai.agent.name\": \"todo-assistant\", \"gen_ai.request.model\": \"deepseek-chat\", \"gen_ai.usage.input_tokens\": 1650, \"g"
+    }
+  ]
+}

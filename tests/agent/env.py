@@ -34,15 +34,57 @@ EVAL_ITEMS = {
 }
 
 
+# 允许从 .env 补进来的键。只收凭证，不读 MODEL_MODE —— 模式由 EVAL_MODE 决定，
+# 免得 .env 里写的是 mock 时把显式请求的真实评测悄悄改回 Mock。
+CREDENTIAL_KEYS = frozenset(
+    {
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "OPENAI_MODEL",
+        "APP_LLM_API_KEY",
+        "APP_LLM_BASE_URL",
+        "APP_LLM_MODEL",
+    }
+)
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _load_credentials_from_dotenv() -> None:
+    """只补凭证，不覆盖 shell 里已有的值。
+
+    评测脚本是独立进程，不会经过 docker compose，所以 compose 自动读 .env 的那套用不上。
+    这里用一个极小的白名单解析器把凭证补进环境，避免为了跑评测再去装 python-dotenv，
+    也避免把 .env 里的其它配置一股脑塞进来。
+    """
+    path = REPO_ROOT / ".env"
+    if not path.exists():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, _, value = stripped.partition("=")
+        key = key.strip()
+        if key not in CREDENTIAL_KEYS or key in os.environ:
+            continue
+        os.environ[key] = value.strip().strip('"').strip("'")
+
+
 def prepare_environment() -> Path:
     """建临时库、灌虚构数据，返回数据库路径。
 
     必须在导入 ``app.main`` 之前调用：Agent 端点在导入时构建，
-    那时读到的 ``APP_LLM_MODE`` 就决定了本次评测是 Mock 还是真实模型。
+    那时读到的 ``MODEL_MODE`` 就决定了本次评测是 Mock 还是真实模型。
     """
-    # 评测默认走 Mock：没有模型凭证时也能跑，且结果可复现。
-    # 如果开发机真的配了真实模型凭证，用 EVAL_MODE=real 显式覆盖，避免误用额度。
-    os.environ["APP_LLM_MODE"] = os.environ.get("EVAL_MODE", "mock").strip() or "mock"
+    # 评测默认走 Mock：没有凭证也能跑，且结果可复现。
+    # 想跑真实模型必须显式 EVAL_MODE=real，避免误用额度、也避免和 Mock 结果混在一起。
+    requested = (os.environ.get("EVAL_MODE") or "mock").strip().lower()
+    if requested in ("real", "openai"):
+        _load_credentials_from_dotenv()
+        os.environ["MODEL_MODE"] = "real"
+    else:
+        os.environ["MODEL_MODE"] = "mock"
 
     # 评测关心「首字时间 / 总耗时」，保留一点间隔更像真实流式；
     # 但不按 50ms 打字速度跑，否则 13 条用例要多等十几秒。

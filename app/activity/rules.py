@@ -1,0 +1,336 @@
+"""活动安排的时间规则：可用时段、排程、校验。
+
+为什么单独一层：
+
+- 生成、推迟、Agent 建议、确认保存**四个入口**必须用同一套判断。写在路由里，
+  迟早会出现"页面拦得住、Agent 绕得过去"；
+- 这一层不 import 数据库、不 import fastapi，所以能脱离服务跑单测，
+  也保证规则只有一份实现。
+
+约定：时间一律是带时区的 aware datetime，落库转成带 +08:00 的 ISO 串。
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from datetime import date, datetime, time, timedelta, timezone
+
+# 一段空闲短于这个值就不排（15 分钟连起身加水都不够）
+MIN_ITEM_MIN = 15
+# 与已有活动的最小间隔，避免两条安排挤在一起
+BUFFER_MIN = 10
+# 时间对齐粒度
+STEP_MIN = 5
+# 推迟至少往后挪这么久，否则"推迟"等于没动
+POSTPONE_GAP_MIN = 30
+
+# 活动库：只用轻量、无医疗表述的说法。
+# 任务书明确不要运动处方、治疗方案或需要专业指导的动作。
+ACTIVITY_CATALOG: dict[str, tuple[str, str]] = {
+    "walk": ("起身走动", "离开座位走一小段，再回来继续。"),
+    "water": ("接水 / 去洗手间", "顺便走动一下，喝口水。"),
+    "stretch": ("肩颈放松", "缓慢转动肩颈，做几个深呼吸。"),
+    "stand": ("站立片刻", "站起来活动一下腿脚，再坐下。"),
+}
+ROTATION = ["walk", "stretch", "water", "stand"]
+
+STATUS_LABELS = {
+    "planned": "待执行",
+    "completed": "已完成",
+    "postponed": "已推迟",
+    "skipped": "今天不方便",
+}
+
+
+class RuleViolation(ValueError):
+    """规则不通过。
+
+    ``code`` 给测试与路由层判断（转成 409/422），``message`` 是给人看的中文。
+    继承 ValueError 是为了让"参数错"这种语义在调用侧也能被 except 到。
+    """
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+# ---------------------------------------------------------------- 时间基础
+
+def tz() -> timezone:
+    """排程用的时区。
+
+    容器默认 UTC，而使用者在东八区。不显式指定，算出来的时间会整体差 8 小时，
+    而且"看起来都合理"，自查时最难发现。
+    """
+    raw = os.environ.get("APP_TZ_OFFSET_HOURS", "8")
+    try:
+        hours = int(str(raw).strip())
+    except (TypeError, ValueError):
+        hours = 8
+    return timezone(timedelta(hours=hours))
+
+
+def now_local() -> datetime:
+    return datetime.now(tz())
+
+
+def at_time(day: date, hhmm: str) -> datetime:
+    hour, minute = hhmm.split(":")
+    return datetime.combine(day, time(int(hour), int(minute)), tzinfo=tz())
+
+
+def parse_dt(text: str) -> datetime:
+    """解析存储的 ISO 串；没有时区的值按本地时区补齐，避免 aware/naive 比较直接报错。"""
+    value = datetime.fromisoformat(text)
+    return value if value.tzinfo else value.replace(tzinfo=tz())
+
+
+def iso(value: datetime) -> str:
+    """落库格式：2026-11-06T10:30:00+08:00。带偏移，换时区也不产生歧义。"""
+    return value.isoformat(timespec="seconds")
+
+
+# ---------------------------------------------------------------- 区间运算
+
+Range = tuple[datetime, datetime]
+
+
+def _merge(ranges: list[Range]) -> list[Range]:
+    out: list[Range] = []
+    for start, end in sorted(ranges):
+        if out and start <= out[-1][1]:
+            out[-1] = (out[-1][0], max(out[-1][1], end))
+        else:
+            out.append((start, end))
+    return out
+
+
+def _subtract(ranges: list[Range], cut: Range) -> list[Range]:
+    cut_start, cut_end = cut
+    out: list[Range] = []
+    for start, end in ranges:
+        if cut_end <= start or cut_start >= end:
+            out.append((start, end))
+            continue
+        if start < cut_start:
+            out.append((start, cut_start))
+        if cut_end < end:
+            out.append((cut_end, end))
+    return out
+
+
+# ---------------------------------------------------------------- 时段计算
+
+def allowed_ranges(settings: dict, day: date) -> list[Range]:
+    """允许活动的区间 = 活动窗口 ∩ 工作时段。
+
+    窗口写到工作时段以外的部分直接裁掉：用户把上午窗口填成 08:00-13:00，
+    也不该在上班前或午休时被安排。
+    """
+    work_start = at_time(day, settings["work_start"])
+    work_end = at_time(day, settings["work_end"])
+    if work_end <= work_start:
+        return []
+
+    out: list[Range] = []
+    for window in settings.get("windows") or []:
+        start = max(at_time(day, window["start"]), work_start)
+        end = min(at_time(day, window["end"]), work_end)
+        if start < end:
+            out.append((start, end))
+    return _merge(out)
+
+
+def quiet_ranges(settings: dict, day: date) -> list[Range]:
+    """免打扰区间。
+
+    ``start > end`` 视为跨天（例如 22:00-07:00）：拆成"当天 22:00 到次日零点"
+    与"当天零点到 07:00"两段。当成一段判的话一条都判不出来，这是最隐蔽的错误。
+    """
+    quiet_start = settings.get("quiet_start")
+    quiet_end = settings.get("quiet_end")
+    if not quiet_start or not quiet_end:
+        return []
+
+    start = at_time(day, quiet_start)
+    end = at_time(day, quiet_end)
+    if start < end:
+        return [(start, end)]
+
+    midnight = datetime.combine(day, time(0, 0), tzinfo=tz())
+    return [(start, midnight + timedelta(days=1)), (midnight, end)]
+
+
+def free_ranges(
+    settings: dict,
+    day: date,
+    busy: list[dict],
+    now: datetime,
+    ignore_id: int | None = None,
+) -> list[Range]:
+    """可用区间 = 允许区间 − 免打扰 − 已占用(±BUFFER) − 已经过去的时间。
+
+    ``ignore_id`` 是推迟场景必需的：算"后面还有没有位置"要把自己排除掉，
+    否则永远和自己原来的时间冲突，表现为"今天永远没有可用时段"。
+    """
+    ranges = allowed_ranges(settings, day)
+    for quiet in quiet_ranges(settings, day):
+        ranges = _subtract(ranges, quiet)
+
+    for activity in busy:
+        if ignore_id is not None and activity.get("id") == ignore_id:
+            continue
+        start = parse_dt(activity["scheduled_at"]) - timedelta(minutes=BUFFER_MIN)
+        end = parse_dt(activity["scheduled_at"]) + timedelta(
+            minutes=int(activity.get("duration_min") or 5) + BUFFER_MIN
+        )
+        ranges = _subtract(ranges, (start, end))
+
+    floor = now + timedelta(minutes=1)
+    out: list[Range] = []
+    for start, end in ranges:
+        start = max(start, floor)
+        if start < end:
+            out.append((start, end))
+    return out
+
+
+def _align_up(value: datetime) -> datetime:
+    extra = (STEP_MIN - value.minute % STEP_MIN) % STEP_MIN
+    return (value + timedelta(minutes=extra)).replace(second=0, microsecond=0)
+
+
+def _at_offset(ranges: list[Range], minutes: float) -> datetime | None:
+    """在总长度里取第 N 分钟对应的时刻。"""
+    remaining = minutes
+    for start, end in ranges:
+        length = (end - start).total_seconds() / 60
+        if remaining <= length:
+            return start + timedelta(minutes=remaining)
+        remaining -= length
+    return None
+
+
+# ---------------------------------------------------------------- 排程
+
+@dataclass
+class Draft:
+    """一条尚未保存的安排。没有 id，因为它还没进库。"""
+
+    at: datetime
+    activity_type: str
+    title: str
+    description: str
+    duration_min: int = 5
+    reason: str = ""
+
+
+def plan_day(
+    settings: dict,
+    day: date,
+    busy: list[dict],
+    now: datetime,
+    count: int,
+) -> tuple[list[Draft], int]:
+    """在可用总时长里等分取中点。
+
+    返回 ``(草稿, 实际条数)``。放不下就少排——不要把 15 分钟切成两条 7 分钟，
+    也不要为了凑数把活动塞进免打扰；条数不足由调用方如实告诉用户。
+    """
+    free = free_ranges(settings, day, busy, now)
+    total = int(sum((end - start).total_seconds() for start, end in free) // 60)
+    capacity = total // MIN_ITEM_MIN
+    if capacity <= 0:
+        raise RuleViolation(
+            "NO_SLOT_AVAILABLE",
+            "今天剩余的可活动时间不足，无法安排活动。可以放宽可活动时段，或减少每天次数。",
+        )
+
+    want = min(max(int(count), 1), capacity)
+    per = total / want
+    drafts: list[Draft] = []
+    for index in range(want):
+        moment = _at_offset(free, per * (index + 0.5))
+        if moment is None:
+            continue
+        moment = _align_up(moment)
+        # 等分后仍可能挨得太近（窗口很长、条数很少），按最小间隔二次过滤
+        if drafts and (moment - drafts[-1].at) < timedelta(minutes=MIN_ITEM_MIN):
+            continue
+        activity_type = ROTATION[len(drafts) % len(ROTATION)]
+        title, description = ACTIVITY_CATALOG[activity_type]
+        drafts.append(
+            Draft(
+                at=moment,
+                activity_type=activity_type,
+                title=title,
+                description=description,
+                reason="按你的可活动时段平均分布",
+            )
+        )
+
+    if not drafts:
+        raise RuleViolation("NO_SLOT_AVAILABLE", "今天剩余的可活动时间不足，无法安排活动。")
+    return drafts, len(drafts)
+
+
+def next_slot(
+    settings: dict,
+    day: date,
+    busy: list[dict],
+    not_before: datetime,
+    now: datetime,
+    ignore_id: int | None = None,
+) -> datetime | None:
+    """推迟用：找 ``not_before`` 之后第一个够长的空闲起点。"""
+    free = free_ranges(settings, day, busy, max(now, not_before), ignore_id=ignore_id)
+    for start, end in free:
+        if end - start >= timedelta(minutes=MIN_ITEM_MIN):
+            return _align_up(start)
+    return None
+
+
+# ---------------------------------------------------------------- 校验
+
+def validate_slot(
+    settings: dict,
+    moment: datetime,
+    day: date,
+    busy: list[dict],
+    now: datetime,
+    ignore_id: int | None = None,
+) -> None:
+    """四个入口共用的校验。不通过抛 RuleViolation，通过则静默返回。
+
+    检查顺序按"用户最容易理解"排：过去时间 → 不在窗口 → 免打扰 → 与已有冲突。
+    """
+    if moment < now - timedelta(minutes=1):
+        raise RuleViolation("PAST_TIME", f"{moment:%H:%M} 已经过去了，请选择之后的时间。")
+
+    if not any(start <= moment < end for start, end in allowed_ranges(settings, day)):
+        raise RuleViolation(
+            "OUTSIDE_WINDOW",
+            f"{moment:%H:%M} 不在可活动时段内，"
+            f"请放在 {settings['work_start']}-{settings['work_end']} 的活动窗口里。",
+        )
+
+    for start, end in quiet_ranges(settings, day):
+        if start <= moment < end:
+            raise RuleViolation(
+                "QUIET_HOURS",
+                f"{moment:%H:%M} 落在免打扰时段 {start:%H:%M}-{end:%H:%M} 内，请换一个时间。",
+            )
+
+    for activity in busy:
+        if ignore_id is not None and activity.get("id") == ignore_id:
+            continue
+        gap = abs((parse_dt(activity["scheduled_at"]) - moment).total_seconds()) / 60
+        need = int(activity.get("duration_min") or 5) + BUFFER_MIN
+        if gap < need:
+            raise RuleViolation(
+                "CONFLICT",
+                f"{moment:%H:%M} 与已有活动（{parse_dt(activity['scheduled_at']):%H:%M}）"
+                f"间隔太近，至少需要 {need} 分钟。",
+            )

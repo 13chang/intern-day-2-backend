@@ -24,6 +24,8 @@ BUFFER_MIN = 10
 STEP_MIN = 5
 # 推迟至少往后挪这么久，否则"推迟"等于没动
 POSTPONE_GAP_MIN = 30
+# 一条活动的默认时长（分钟）
+DEFAULT_DURATION_MIN = 5
 
 # 活动库：只用轻量、无医疗表述的说法。
 # 任务书明确不要运动处方、治疗方案或需要专业指导的动作。
@@ -182,11 +184,12 @@ def free_ranges(
     for activity in busy:
         if ignore_id is not None and activity.get("id") == ignore_id:
             continue
-        start = parse_dt(activity["scheduled_at"]) - timedelta(minutes=BUFFER_MIN)
-        end = parse_dt(activity["scheduled_at"]) + timedelta(
-            minutes=int(activity.get("duration_min") or 5) + BUFFER_MIN
-        )
-        ranges = _subtract(ranges, (start, end))
+        # 以已有活动为中心左右各让开 gap_needed：
+        # 校验用的是"两个起点之间的绝对间隔"，所以这里必须对称地扣，
+        # 只扣一侧就会出现"算得出、存不进"的落点。
+        pad = timedelta(minutes=gap_needed(activity))
+        center = parse_dt(activity["scheduled_at"])
+        ranges = _subtract(ranges, (center - pad, center + pad))
 
     floor = now + timedelta(minutes=1)
     out: list[Range] = []
@@ -202,12 +205,54 @@ def _align_up(value: datetime) -> datetime:
     return (value + timedelta(minutes=extra)).replace(second=0, microsecond=0)
 
 
+def _align_down(value: datetime) -> datetime:
+    extra = value.minute % STEP_MIN
+    return (value - timedelta(minutes=extra)).replace(second=0, microsecond=0)
+
+
+def _align_within(ranges: list[Range], moment: datetime, need: int) -> datetime | None:
+    """把 ``moment`` 对齐到 STEP_MIN，且保证对齐后的整段仍在它所属的可用区间内。
+
+    只写 ``_align_up`` 是不够的：它是向上取整，等分中点落在区间末尾前几分钟时
+    （例如中点 14:57、这段区间到 15:00 结束），取整会跳到 15:00 —— 正好是免打扰
+    的起点。结果是"生成看着正常、确认保存时被规则拒掉"，而生成和校验各自看都自洽，
+    复现还依赖具体时刻，属于最难自查的一类。
+    越界就退回区间内最后一个对齐点；连退回都放不下这段时长，就放弃这一条。
+    """
+    for start, end in ranges:
+        if not (start <= moment < end):
+            continue
+        aligned = _align_up(moment)
+        if aligned + timedelta(minutes=need) <= end:
+            return aligned
+        back = _align_down(moment)
+        if start <= back and back + timedelta(minutes=need) <= end:
+            return back
+        return None
+    return None
+
+
+def gap_needed(activity: dict) -> int:
+    """与某条已有活动之间至少要隔开多少分钟。
+
+    单一来源：``free_ranges``（排程、找空位）和 ``validate_slot``（四个入口的校验）
+    都调它。之前两边各写一份，左边按 BUFFER_MIN、右边按 时长+BUFFER_MIN，
+    结果**排程能算出落点、保存时却被判冲突** —— 表现为"建议了两条，确认第一条就 422"。
+    """
+    return int(activity.get("duration_min") or 5) + BUFFER_MIN
+
+
 def _at_offset(ranges: list[Range], minutes: float) -> datetime | None:
-    """在总长度里取第 N 分钟对应的时刻。"""
+    """在总长度里取第 N 分钟对应的时刻。
+
+    右端点必须算"区间外"：``remaining == length`` 时说明这个偏移正好落在区间末尾，
+    那是下一段禁区（免打扰或已有活动）的起点，不是可选落点。用 ``<=`` 会把它当成
+    合法值返回，后面即使对齐也救不回来。
+    """
     remaining = minutes
     for start, end in ranges:
         length = (end - start).total_seconds() / 60
-        if remaining <= length:
+        if remaining < length:
             return start + timedelta(minutes=remaining)
         remaining -= length
     return None
@@ -223,7 +268,7 @@ class Draft:
     activity_type: str
     title: str
     description: str
-    duration_min: int = 5
+    duration_min: int = DEFAULT_DURATION_MIN
     reason: str = ""
 
 
@@ -255,7 +300,9 @@ def plan_day(
         moment = _at_offset(free, per * (index + 0.5))
         if moment is None:
             continue
-        moment = _align_up(moment)
+        moment = _align_within(free, moment, DEFAULT_DURATION_MIN)
+        if moment is None:
+            continue
         # 等分后仍可能挨得太近（窗口很长、条数很少），按最小间隔二次过滤
         if drafts and (moment - drafts[-1].at) < timedelta(minutes=MIN_ITEM_MIN):
             continue
@@ -270,6 +317,18 @@ def plan_day(
                 reason="按你的可活动时段平均分布",
             )
         )
+
+    # 最后一道闸：排出来的每一条都必须能通过保存时的校验。
+    # "生成"和"确认保存"是两个入口，共用同一套规则；这里把不变式钉死，
+    # 以后改 free_ranges / plan_day 也不会再出现"排得出、存不进"。
+    kept: list[Draft] = []
+    for draft in drafts:
+        try:
+            validate_slot(settings, draft.at, day, busy, now)
+        except RuleViolation:
+            continue
+        kept.append(draft)
+    drafts = kept
 
     if not drafts:
         raise RuleViolation("NO_SLOT_AVAILABLE", "今天剩余的可活动时间不足，无法安排活动。")
@@ -327,7 +386,7 @@ def validate_slot(
         if ignore_id is not None and activity.get("id") == ignore_id:
             continue
         gap = abs((parse_dt(activity["scheduled_at"]) - moment).total_seconds()) / 60
-        need = int(activity.get("duration_min") or 5) + BUFFER_MIN
+        need = gap_needed(activity)
         if gap < need:
             raise RuleViolation(
                 "CONFLICT",

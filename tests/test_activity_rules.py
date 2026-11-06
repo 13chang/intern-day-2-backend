@@ -270,3 +270,58 @@ def test_allowed_ranges_still_pure_when_nothing_matches() -> None:
     """
     settings = {**SETTINGS, "work_start": "09:00", "work_end": "10:00"}
     assert rules.allowed_ranges(settings, DAY) == []
+
+
+def test_no_overlap_points_at_work_end_when_it_is_too_early() -> None:
+    """工作结束时间太早时，提示要点名"工作结束时间"，而不是笼统说没重叠。
+
+    真实场景：用户把可活动时段改成 11:00-12:00，工作结束还留在 10:00，
+    看到"没有重叠"只会认为"我明明改了"，所以必须点出该动哪个框。
+    """
+    settings = {
+        **SETTINGS,
+        "work_start": "09:00",
+        "work_end": "10:00",
+        "windows": [{"label": "morning", "start": "11:00", "end": "12:00"}],
+    }
+    with pytest.raises(rules.RuleViolation) as exc:
+        rules.free_ranges(settings, DAY, [], NOW)
+
+    message = exc.value.message
+    assert exc.value.code == "NO_ALLOWED_RANGE"
+    assert "工作结束时间" in message
+    assert "11:00" in message
+    assert "09:00-10:00" in message
+
+
+def test_no_overlap_points_at_work_start_when_it_is_too_late() -> None:
+    """反过来：上班时间晚于所有可活动时段，提示要点名"工作开始时间"。"""
+    settings = {
+        **SETTINGS,
+        "work_start": "18:00",
+        "work_end": "22:00",
+        "windows": [{"label": "morning", "start": "11:00", "end": "12:00"}],
+    }
+    with pytest.raises(rules.RuleViolation) as exc:
+        rules.free_ranges(settings, DAY, [], NOW)
+
+    message = exc.value.message
+    assert "工作开始时间" in message
+    assert "最晚" in message
+
+
+def test_no_overlap_when_windows_sit_on_both_sides() -> None:
+    """一段在上班前、一段在下班后：两侧都不越界，走通用提示。"""
+    settings = {
+        **SETTINGS,
+        "work_start": "12:00",
+        "work_end": "13:00",
+        "windows": [
+            {"label": "before", "start": "10:00", "end": "11:00"},
+            {"label": "after", "start": "14:00", "end": "15:00"},
+        ],
+    }
+    with pytest.raises(rules.RuleViolation) as exc:
+        rules.free_ranges(settings, DAY, [], NOW)
+
+    assert "上班前和下班后" in exc.value.message

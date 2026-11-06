@@ -588,12 +588,12 @@ invoke_agent todo-assistant  1723ms
 
 ```bash
 uv run pytest -q
-# 244 passed
+# 247 passed
 ```
 
 新增四个文件：
 
-- `tests/test_activity_rules.py`（23 个用例）：窗口裁剪、免打扰把一段切成两段、跨天免打扰、
+- `tests/test_activity_rules.py`（26 个用例）：窗口裁剪、免打扰把一段切成两段、跨天免打扰、
   排程避开免打扰、时间不足时少排、当天没空位、过去时间、窗口外、冲突、推迟排除自身、
   工作时段与可活动时段无交集、ISO 往返与时区补齐；
 - `tests/test_activity_api.py`（24 个用例）：设置默认值与校验，唯一索引拦住同时刻第二条，已完成时刻不再被建议或重复确认，全部完成后重复生成被拦、生成幂等、三个操作的状态流转与幂等、

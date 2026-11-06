@@ -153,27 +153,61 @@ def describe_windows(settings: dict) -> str:
     return "、".join(f"{item['start']}-{item['end']}" for item in windows)
 
 
+def _minutes(hhmm: str) -> int:
+    hour, minute = hhmm.split(":")
+    return int(hour) * 60 + int(minute)
+
+
+def _hhmm(minutes: int) -> str:
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
+
+
 def allowed_or_raise(settings: dict, day: date) -> list[Range]:
-    """``allowed_ranges`` 的非空版本：交集为空就直接说清是哪两段没搭上。
+    """``allowed_ranges`` 的非空版本：交集为空就直接说清是哪一侧越界。
 
     专门用来区分一类很误导的失败：工作时段 09:00-10:00 配可活动时段 11:00-17:00，
-    交集是空集，**任何引擎**都不可能排出东西。以前这种配置会一路走到
-    "可用时间不足"或者"模型给的时间都不满足条件"，提示语看着像模型抽风，
-    用户完全看不出是自己的两段配置压根没重叠。
+    交集是空集，**任何引擎**都不可能排出东西。
+
+    只说"没有重叠"是不够的——用户刚改完可活动时段，看到这句话只会认为"我明明改了"。
+    所以这里判断是哪一侧越界（工作结束太早 / 工作开始太晚 / 两头都错开），
+    把该改的字段和该改成的时间点出来。
     """
     ranges = allowed_ranges(settings, day)
     if ranges:
         return ranges
-    if not (settings.get("windows") or []):
+
+    windows = settings.get("windows") or []
+    if not windows:
         raise RuleViolation(
             "NO_ALLOWED_RANGE",
             "还没有设置可活动时段，任何时间都不在允许范围内。先添加至少一个可活动时段。",
         )
+
+    work_start = settings["work_start"]
+    work_end = settings["work_end"]
+    work_span = f"工作时段 {work_start}-{work_end}"
+    window_text = describe_windows(settings)
+    earliest = min(_minutes(item["start"]) for item in windows)
+    latest = max(_minutes(item["end"]) for item in windows)
+
+    if _minutes(work_end) <= earliest:
+        raise RuleViolation(
+            "NO_ALLOWED_RANGE",
+            f"{work_span} 与可活动时段 {window_text} 没有重叠：时段最早 {_hhmm(earliest)} 才开始，"
+            f"而 {work_end} 就下班了。把工作结束时间改到 {_hhmm(earliest)} 之后，"
+            f"或者把时段挪进 {work_start}-{work_end} 里。",
+        )
+    if _minutes(work_start) >= latest:
+        raise RuleViolation(
+            "NO_ALLOWED_RANGE",
+            f"{work_span} 与可活动时段 {window_text} 没有重叠：时段最晚 {_hhmm(latest)} 就结束了，"
+            f"而 {work_start} 才开始上班。把工作开始时间改到 {_hhmm(latest)} 之前，"
+            f"或者把时段往后挪。",
+        )
     raise RuleViolation(
         "NO_ALLOWED_RANGE",
-        f"工作时段 {settings['work_start']}-{settings['work_end']} 与可活动时段 "
-        f"{describe_windows(settings)} 没有重叠，任何时间都排不进去。"
-        f"把可活动时段挪进工作时段，或者放宽工作时段。",
+        f"{work_span} 与可活动时段 {window_text} 没有重叠（时段分别在上班前和下班后），"
+        f"任何时间都排不进去。把可活动时段挪进工作时段，或者放宽工作时段。",
     )
 
 

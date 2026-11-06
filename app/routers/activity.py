@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import date, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -15,6 +16,8 @@ from pydantic import BaseModel, Field
 from app.activity import planner, rules, service
 from app.agent.config import load_llm_settings
 from app.deps import get_current_user
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/activity", tags=["activity"])
 
@@ -295,6 +298,17 @@ def suggestions(
     conditions = request.conditions.model_dump() if request.conditions else None
     note = (request.note or "").strip()
     dropped = 0
+
+    # 这一行是排查"选了 DeepSeek 却还是规则结果"的关键：
+    # 请求体里到底有没有 engine=llm，只能从服务端日志看出来（页面上的结果长得太像）。
+    # 只记参数与结果数量，不记条件内容和偏好文本。
+    logger.info(
+        "suggestions 请求：engine=%s count=%s 条件覆盖=%s 偏好=%s",
+        request.engine,
+        request.count,
+        sorted(key for key, value in (conditions or {}).items() if value not in (None, "", [], False)),
+        bool(note),
+    )
 
     try:
         if request.engine == "llm":

@@ -202,6 +202,11 @@ def build_prompt(
 【用户的偏好】
 {preference}
 
+偏好用来决定三件事：挑哪一类活动（在上面四类里）、排多密、说明怎么写。
+如果偏好落在上面四类之外（球类、健身、跑步、需要场地或器械的，例如"打篮球"），
+**不要硬凑**：照常从四类里排，并在 explanation 里如实说明这次没能排进来，
+不要声称已经满足了偏好。
+
 【输出格式】
 {{"explanation": "一句话说明你为什么这样排，中文，40 字以内",
   "suggestions": [{{"time": "HH:MM", "activity_type": "walk",
@@ -214,7 +219,9 @@ def build_prompt(
 2. 相邻两条之间至少间隔 15 分钟；
 3. 最多 {min(count, MAX_ITEMS)} 条；区间不够就少给，不要凑数；
 4. 只描述轻微、无需器械的活动，不写运动处方、不提疾病、不做健康评价；
-5. 中文输出。"""
+5. explanation 必须和建议本身一致：不能一边说"按你的偏好安排了打球"、
+   一边给的却是走动和拉伸；
+6. 中文输出。"""
 
 
 # ---------------------------------------------------------------- 解析
@@ -285,18 +292,26 @@ def _clip(text: str, limit: int) -> str:
 def _to_draft(item: _Item, day) -> rules.Draft:
     """把模型的一条建议转成草稿。
 
-    标题和说明允许模型自己写（比固定文案贴合用户偏好），但活动类型必须落在活动库里，
-    文案缺失时回落到库里那一份 —— 这样即使模型瞎编一个类型，也不会出现
-    "未知类型 + 一段没有依据的描述"。
+    标题和说明允许模型自己写（比固定文案贴合用户偏好），但活动类型必须落在活动库里。
+    类型不认识时**连文案一起换掉**，不留模型那份：它既然把类型写成 basketball，
+    标题多半也在说打球，留着就会出现"类型是走动、标题是去打球"的 5 分钟假满足。
     """
-    activity_type = item.activity_type if item.activity_type in rules.ACTIVITY_CATALOG else "walk"
-    fallback_title, fallback_description = rules.ACTIVITY_CATALOG[activity_type]
+    if item.activity_type in rules.ACTIVITY_CATALOG:
+        activity_type = item.activity_type
+        fallback_title, fallback_description = rules.ACTIVITY_CATALOG[activity_type]
+        title = _clip(item.title, MAX_TITLE) or fallback_title
+        description = _clip(item.description, MAX_DESCRIPTION) or fallback_description
+        reason = _clip(item.reason, MAX_REASON)
+    else:
+        activity_type = "walk"
+        title, description = rules.ACTIVITY_CATALOG[activity_type]
+        reason = ""
     return rules.Draft(
         at=rules.at_time(day, item.time),
         activity_type=activity_type,
-        title=_clip(item.title, MAX_TITLE) or fallback_title,
-        description=_clip(item.description, MAX_DESCRIPTION) or fallback_description,
-        reason=_clip(item.reason, MAX_REASON),
+        title=title,
+        description=description,
+        reason=reason,
     )
 
 

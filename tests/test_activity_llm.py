@@ -167,6 +167,50 @@ def test_llm_falls_back_to_catalog_text(client: TestClient, demo: dict, frozen, 
     assert draft["title"] == rules.ACTIVITY_CATALOG["walk"][0]
 
 
+def test_unknown_type_also_drops_model_wording(
+    client: TestClient, demo: dict, frozen, llm
+) -> None:
+    """类型不认识时，模型写的那份文案也不能留。
+
+    否则会出现"类型是走动、标题是去打球、时长 5 分钟"的假满足 ——
+    用户看到标题以为偏好生效了，实际排的还是一次起身走动。
+    """
+    save_settings(client, demo["headers"])
+    llm(
+        {
+            "suggestions": [
+                {
+                    "time": "10:30",
+                    "activity_type": "basketball",
+                    "title": "去打球",
+                    "description": "找同事打一会儿篮球",
+                    "reason": "按你的偏好安排",
+                }
+            ]
+        }
+    )
+
+    status, body = suggest(client, demo["headers"], engine="llm", count=1)
+
+    assert status == 200, body
+    draft = body["suggestions"][0]
+    assert draft["activity_type"] == "walk"
+    assert draft["title"] == rules.ACTIVITY_CATALOG["walk"][0]
+    assert draft["description"] == rules.ACTIVITY_CATALOG["walk"][1]
+    assert draft["reason"] == ""
+
+
+def test_prompt_tells_model_not_to_fake_unsupported_preference(frozen) -> None:
+    """偏好超出四类时，提示词要求如实说明，不许嘴上说"已按偏好安排"。"""
+    prompt = planner.build_prompt({**SETTINGS}, DAY, [], NOW, 2, "打篮球")
+
+    assert "打篮球" in prompt
+    assert "不要硬凑" in prompt
+    assert "如实说明" in prompt
+    # explanation 与建议必须一致，别一边说打球一边给拉伸
+    assert "explanation 必须和建议本身一致" in prompt
+
+
 def test_llm_dedupes_same_time(client: TestClient, demo: dict, frozen, llm) -> None:
     """同一个时间给两条，只留一条 —— 否则用户会勾到两条一模一样的安排。"""
     save_settings(client, demo["headers"])

@@ -23,6 +23,11 @@ from fastapi.testclient import TestClient
 os.environ["MODEL_MODE"] = "mock"
 os.environ["APP_LLM_MODE"] = "mock"
 
+# 应用起来时会自动读仓库根目录的 .env（见 app/envfile.py）。
+# 测试必须和开发机上的 .env 无关：否则"本机配了 DeepSeek 就能过、换台机器就红"，
+# 而且 .env 里的密钥会进到测试进程里。这里整体关掉。
+os.environ["APP_SKIP_ENV_FILE"] = "1"
+
 # Mock 默认按打字速度每 6 字停 25ms；测试不需要看打字效果，
 # 这里关掉等待，避免十几个流式用例各自多等一秒多。
 # 打字节奏本身由 test_agent_config.py 里显式传 chunk_delay 的用例覆盖。

@@ -145,7 +145,37 @@ docker compose up --build -d
 # 想切回 Mock：把 .env 的 MODEL_MODE 改成 mock，再重启容器即可
 ```
 
-当前是哪种模式，看启动日志、`GET /agent/info` 的 `mode` 字段，或前端页面顶部的标注。
+### 3.4.1 `.env` 怎么被读到（两种启动方式都覆盖）
+
+| 启动方式 | 谁读 `.env` |
+| --- | --- |
+| `docker compose up` | compose 自己读，按 `MODEL_MODE: "${MODEL_MODE:-mock}"` 注入容器 |
+| devcontainer / `uv run uvicorn` | 应用自己读（`app/envfile.py`，在 `app/__init__.py` 里执行） |
+
+第二种是补上的。在此之前，devcontainer 里直接 `uv run uvicorn` 没有任何东西读 `.env`：
+`devcontainer.json` 没有 `--env-file`，进程环境里也没有这三个变量，
+于是 `MODEL_MODE=real` 明明写在文件里，`load_llm_settings()` 却走 `auto` 分支、
+发现没凭证、**安静地退回 Mock**。表现就是页面上"DeepSeek 真实模型"一直是未启用，
+而改 `.env` 怎么改都没反应。
+
+现在的关系是"真实环境变量优先，`.env` 只补空缺"：compose / 容器 / CI 注入的值
+永远压过文件里的值，避免"容器传了 mock 却被 .env 改回 real"这类事故。
+
+| 变量 | 说明 |
+| --- | --- |
+| `APP_ENV_FILE` | 指定要读的 `.env` 路径（默认先看当前目录，再往上找） |
+| `APP_SKIP_ENV_FILE` | 设成 `1` 就不自动读 `.env`。测试用它保证与开发机配置无关 |
+| `APP_LOG_LEVEL` | 应用日志级别，默认 `INFO`。可调 `DEBUG` / `WARNING` |
+
+启动时日志会说明读了哪些键（只有键名，没有值）：
+
+```
+INFO:     已从 /workspace/.env 补充配置：MODEL_MODE, OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
+INFO:     MODEL_MODE=real：真实模型 model=deepseek-chat base_url=https://api.deepseek.com/v1（密钥不进日志）
+```
+
+当前是哪种模式，看启动日志、`GET /agent/info` 的 `mode` 字段、
+`GET /activity/engines` 里 llm 的 `available`，或前端建议面板上的按钮状态。
 
 **为什么必须用 `OpenAIChatCompletionClient`**：它打 `/chat/completions`。
 同包里的 `OpenAIChatClient` 打的是 `/responses`（OpenAI Responses API），
@@ -529,10 +559,10 @@ invoke_agent todo-assistant  1723ms
 
 ```bash
 uv run pytest -q
-# 217 passed
+# 226 passed
 ```
 
-新增三个文件：
+新增四个文件：
 
 - `tests/test_activity_rules.py`（20 个用例）：窗口裁剪、免打扰把一段切成两段、跨天免打扰、
   排程避开免打扰、时间不足时少排、当天没空位、过去时间、窗口外、冲突、推迟排除自身、
@@ -543,7 +573,10 @@ uv run pytest -q
 - `tests/test_activity_llm.py`（19 个用例）：引擎可用性、模型产出经校验后才算数、
   不合规建议被丢弃并计数、非法活动类型回落到活动库文案、同一时间去重、
   Markdown 代码块里的 JSON、回复不是 JSON、一条都不合规则、条件覆盖（窗口/免打扰开关/次数）、
-  临时条件不改已保存设置、保存时重新校验模型建议。
+  临时条件不改已保存设置、保存时重新校验模型建议；
+- `tests/test_envfile.py`（9 个用例）：注释/空行/`export` 前缀/成对引号/值里带 `=`、
+  非法键名跳过、**真实环境变量优先**、空串视为未设置、文件不存在不算错、
+  跳过开关只挡自动查找、以及"只 `import app` 就能读到 `.env`"的端到端用例。
 
 其中三条是用来钉住「排得出必须存得进」这个不变式的：排程算出的落点，
 必须能被保存时的校验接受。验收时正是在这里翻的车——生成给出 3 条建议、

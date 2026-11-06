@@ -410,3 +410,153 @@ def test_unique_index_allows_different_users_at_the_same_moment(
     }
     assert demo_times and other_times
     assert demo_times & other_times, "两个账号都被排到同一批时刻，说明互不影响"
+
+
+# ---------------------------------------------------------------- 往前规划
+
+def test_generate_for_tomorrow_writes_to_that_day(
+    client: TestClient, demo: dict, frozen
+) -> None:
+    """排明天就只动明天：今天的列表一条都不该多出来。"""
+    tomorrow = DAY + timedelta(days=1)
+    save_settings(client, demo["headers"])
+
+    response = client.post(
+        f"/activity/generate?day={tomorrow.isoformat()}", headers=demo["headers"]
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["day"] == tomorrow.isoformat(), "回显的日期要和请求的一致"
+    assert body["created"] >= 1
+    assert all(
+        item["scheduled_at"].startswith(tomorrow.isoformat()) for item in body["activities"]
+    )
+
+    today_rows = client.get("/activity/today", headers=demo["headers"]).json()
+    assert today_rows == []
+
+
+def test_generate_for_past_day_is_422(client: TestClient, demo: dict, frozen) -> None:
+    """过去的日子说清是日期的问题，不能混成"这天排满了"（409）。"""
+    past = DAY - timedelta(days=1)
+    response = client.post(
+        f"/activity/generate?day={past.isoformat()}", headers=demo["headers"]
+    )
+    assert response.status_code == 422
+    assert "已经过去" in response.json()["detail"]
+
+
+def test_generate_beyond_limit_is_422(client: TestClient, demo: dict, frozen) -> None:
+    far = DAY + timedelta(days=rules.MAX_PLAN_DAYS + 1)
+    response = client.post(f"/activity/generate?day={far.isoformat()}", headers=demo["headers"])
+    assert response.status_code == 422
+    assert "最多只能规划到" in response.json()["detail"]
+
+
+def test_listing_a_past_day_is_allowed(client: TestClient, demo: dict, frozen) -> None:
+    """看历史不拦：只读、没有副作用。周末回头看周三做了几次是正常需求。"""
+    past = DAY - timedelta(days=2)
+    response = client.get(f"/activity/today?day={past.isoformat()}", headers=demo["headers"])
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+def test_suggestions_can_target_tomorrow(client: TestClient, demo: dict, frozen) -> None:
+    tomorrow = DAY + timedelta(days=1)
+    save_settings(client, demo["headers"])
+
+    response = client.post(
+        "/activity/suggestions",
+        headers=demo["headers"],
+        json={"engine": "rule", "count": 2, "day": tomorrow.isoformat()},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["day"] == tomorrow.isoformat()
+    assert len(body["suggestions"]) == 2
+    assert all(
+        item["scheduled_at"].startswith(tomorrow.isoformat()) for item in body["suggestions"]
+    )
+    # 说明文字也得跟着日期走，否则用户看不出这批是排给哪天的
+    assert body["explanation"].startswith("明天")
+
+
+def test_suggestions_for_past_day_is_422(client: TestClient, demo: dict, frozen) -> None:
+    past = DAY - timedelta(days=1)
+    response = client.post(
+        "/activity/suggestions",
+        headers=demo["headers"],
+        json={"engine": "rule", "day": past.isoformat()},
+    )
+    assert response.status_code == 422
+    assert "已经过去" in response.json()["detail"]
+
+
+def test_confirm_returns_the_day_it_saved_to(
+    client: TestClient, demo: dict, frozen
+) -> None:
+    """确认"明天"的建议后返回的必须是明天的列表。
+
+    以前这里写死 now.date()，保存成功了却返回今天的列表 ——
+    页面上什么都不出现，看起来像没存上。
+    """
+    tomorrow = DAY + timedelta(days=1)
+    save_settings(client, demo["headers"])
+    items = [
+        {
+            "scheduled_at": f"{tomorrow.isoformat()}T10:00:00+08:00",
+            "activity_type": "walk",
+            "title": "起身走动",
+            "description": "走一小段",
+            "duration_min": 5,
+            "reason": "上午",
+        }
+    ]
+    response = client.post(
+        "/activity/confirm", headers=demo["headers"], json={"items": items}
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["day"] == tomorrow.isoformat()
+    assert [item["scheduled_at"][:10] for item in body["activities"]] == [
+        tomorrow.isoformat()
+    ]
+
+
+def test_overview_lists_every_day_including_empty_ones(
+    client: TestClient, demo: dict, frozen
+) -> None:
+    """日期条要"哪天有安排、做了几条"，空着的日子也得占一格。"""
+    tomorrow = DAY + timedelta(days=1)
+    save_settings(client, demo["headers"])
+    client.post("/activity/generate", headers=demo["headers"])
+    client.post(f"/activity/generate?day={tomorrow.isoformat()}", headers=demo["headers"])
+
+    response = client.get("/activity/overview?days=3", headers=demo["headers"])
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["today"] == DAY.isoformat()
+    assert body["max_plan_days"] == rules.MAX_PLAN_DAYS
+    assert [item["date"] for item in body["days"]] == [
+        DAY.isoformat(),
+        tomorrow.isoformat(),
+        (DAY + timedelta(days=2)).isoformat(),
+    ]
+    assert body["days"][0]["planned"] == 3
+    assert body["days"][1]["planned"] == 3
+    assert body["days"][2]["total"] == 0, "没有安排的日期也要出现，不然前端还得自己补"
+
+
+def test_overview_counts_only_original_items(
+    client: TestClient, demo: dict, frozen
+) -> None:
+    """推迟产生的替代条目不重复计数 —— 和周统计同一口径。"""
+    save_settings(client, demo["headers"])
+    items = client.post("/activity/generate", headers=demo["headers"]).json()["activities"]
+    assert items
+    client.post(f"/activity/{items[0]['id']}/postpone", headers=demo["headers"])
+
+    body = client.get("/activity/overview?days=1", headers=demo["headers"]).json()
+    day = body["days"][0]
+    assert day["total"] == 3, "推掉一条又补一条，总数不能变成 4"
+    assert day["postponed"] == 1

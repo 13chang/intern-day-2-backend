@@ -586,3 +586,62 @@ def test_prompt_only_offers_free_ranges(frozen) -> None:
     assert "15:00-16:00" not in prompt
     assert "下午容易困" in prompt
     assert "walk" in prompt and "stretch" in prompt
+
+
+def test_prompt_for_future_day_drops_todays_clock_constraints(frozen) -> None:
+    """排明天时不能还把"现在几点"当约束喂给模型。
+
+    未来那天不存在"已经过去"，硬塞一句"不早于现在"，模型会以为只能在
+    今天剩下的时间附近挑，排出来的东西全得被后端丢掉。
+    """
+    tomorrow = DAY + timedelta(days=1)
+    prompt = planner.build_prompt(SETTINGS, tomorrow, [], NOW, 2)
+
+    assert tomorrow.isoformat() in prompt
+    assert "还没到" in prompt
+    assert "不早于现在" not in prompt
+    assert "用户希望今天安排" not in prompt
+
+
+def test_llm_engine_accepts_a_future_day(client: TestClient, demo: dict, frozen, llm) -> None:
+    tomorrow = DAY + timedelta(days=1)
+    save_settings(client, demo["headers"])
+    llm(
+        {
+            "explanation": "明天上午下午各排一次",
+            "suggestions": [
+                {"time": "10:30", "activity_type": "walk", "title": "起身走动",
+                 "description": "走一小段", "reason": "上午精神好的时候"},
+                {"time": "14:30", "activity_type": "water", "title": "接水",
+                 "description": "顺便喝口水", "reason": "下午开头"},
+            ],
+        }
+    )
+
+    status, body = suggest(
+        client, demo["headers"], engine="llm", count=2, day=tomorrow.isoformat()
+    )
+
+    assert status == 200, body
+    assert body["day"] == tomorrow.isoformat()
+    assert all(
+        item["scheduled_at"].startswith(tomorrow.isoformat()) for item in body["suggestions"]
+    )
+
+
+def test_llm_engine_rejects_past_day_without_calling_the_model(
+    client: TestClient, demo: dict, frozen, monkeypatch
+) -> None:
+    """日期越界要在调模型之前就拒掉，别白花一次调用。"""
+    calls: list[str] = []
+    monkeypatch.setattr(
+        planner, "default_completer", lambda: (lambda prompt: calls.append(prompt) or "{}")
+    )
+
+    status, body = suggest(
+        client, demo["headers"], engine="llm", day=(DAY - timedelta(days=1)).isoformat()
+    )
+
+    assert status == 422
+    assert "已经过去" in body["detail"]
+    assert calls == [], "条件已经不可能满足，不该再调模型"

@@ -43,6 +43,10 @@ _STATUS_BY_CODE = {
     # 工作时段和可活动时段没有交集：这组条件本身自相矛盾，任何引擎都排不出东西，
     # 属于请求内容不合法，用 422（详情里会写清是哪两段没搭上）。
     "NO_ALLOWED_RANGE": _UNPROCESSABLE,
+    # 目标日期越界（已经过去 / 超过 MAX_PLAN_DAYS）。这是请求参数的问题，
+    # 不是"这天排满了"，所以不能和 NO_SLOT_AVAILABLE 混成 409。
+    "PAST_DAY": _UNPROCESSABLE,
+    "DAY_TOO_FAR": _UNPROCESSABLE,
 }
 
 
@@ -92,6 +96,8 @@ class ActivityOut(BaseModel):
 
 
 class GenerateOut(BaseModel):
+    # 回显目标日期：页面上同时能看今天和未来几天，客户端据此确认"这批是排给哪天的"
+    day: str = ""
     created: int
     activities: list[ActivityOut]
     notice: str = ""
@@ -133,6 +139,7 @@ class SuggestRequest(BaseModel):
     count: int | None = Field(default=None, ge=1, le=8)
     note: str | None = Field(default=None, max_length=200, description="自然语言偏好")
     conditions: ConditionsIn | None = None
+    day: date | None = Field(default=None, description="目标日期，不传就是今天")
 
 
 class SuggestOut(BaseModel):
@@ -140,6 +147,7 @@ class SuggestOut(BaseModel):
     explanation: str
     notice: str = ""
     mode: str = "rule"
+    day: str = Field(default="", description="这批建议是排给哪一天的")
     dropped: int = Field(default=0, description="模型给出但被规则丢掉的条数")
 
 
@@ -163,7 +171,25 @@ class ConfirmRequest(BaseModel):
 
 class ConfirmOut(BaseModel):
     saved: int
+    day: str = Field(default="", description="这批保存到哪一天")
     activities: list[ActivityOut]
+
+
+class DayOverview(BaseModel):
+    """日期条上的一天：有几天条、几条待执行、几条已完成。"""
+
+    date: str
+    total: int = 0
+    planned: int = 0
+    completed: int = 0
+    postponed: int = 0
+    skipped: int = 0
+
+
+class OverviewOut(BaseModel):
+    today: str
+    max_plan_days: int = Field(description="最多能提前几天规划")
+    days: list[DayOverview]
 
 
 class SkipRequest(BaseModel):
@@ -192,21 +218,41 @@ def update_settings(
 
 # ---------------------------------------------------------------- 当天安排
 
-@router.get("/today", response_model=list[ActivityOut], summary="当天的活动安排")
+@router.get("/today", response_model=list[ActivityOut], summary="某天的活动安排")
 def list_today(
-    day: date | None = Query(default=None, description="不传就是今天"),
+    day: date | None = Query(default=None, description="不传就是今天；可以看过去的日期"),
     user: dict = Depends(get_current_user),
 ) -> list[dict]:
+    """看过去的日子不拦：那是已经发生的历史，只读没有副作用。
+
+    "不能给过去排活动"由 ``/generate`` 和 ``/suggestions`` 把关（``ensure_plannable``），
+    不是这里 —— 否则周末想回头看周三做了几次都看不了。
+    """
     return service.list_day(user["id"], day or rules.now_local().date())
 
 
-@router.post("/generate", response_model=GenerateOut, summary="生成当天安排")
+@router.get("/overview", response_model=OverviewOut, summary="接下来几天的安排概况")
+def overview(
+    days: int = Query(default=7, ge=1, le=rules.MAX_PLAN_DAYS + 1, description="从今天起看几天"),
+    user: dict = Depends(get_current_user),
+) -> dict:
+    """页面顶部日期条用的数据：每天各几条，一次查完。"""
+    today = rules.now_local().date()
+    return {
+        "today": today.isoformat(),
+        "max_plan_days": rules.MAX_PLAN_DAYS,
+        "days": service.overview_days(user["id"], today, days),
+    }
+
+
+@router.post("/generate", response_model=GenerateOut, summary="生成某天的安排")
 def generate(
-    force: bool = Query(default=False, description="true 时重建当天待执行安排"),
+    force: bool = Query(default=False, description="true 时重建那天待执行的安排"),
+    day: date | None = Query(default=None, description="不传就是今天；最远到今天 +14 天"),
     user: dict = Depends(get_current_user),
 ) -> dict:
     try:
-        return service.generate_day(user["id"], rules.now_local().date(), force)
+        return service.generate_day(user["id"], day or rules.now_local().date(), force)
     except rules.RuleViolation as exc:
         raise _http(exc) from exc
 
@@ -308,26 +354,30 @@ def suggestions(
     request = payload or SuggestRequest()
     conditions = request.conditions.model_dump() if request.conditions else None
     note = (request.note or "").strip()
+    now = rules.now_local()
+    day = request.day or now.date()
     dropped = 0
 
     # 这一行是排查"选了 DeepSeek 却还是规则结果"的关键：
     # 请求体里到底有没有 engine=llm，只能从服务端日志看出来（页面上的结果长得太像）。
     # 只记参数与结果数量，不记条件内容和偏好文本。
     logger.info(
-        "suggestions 请求：engine=%s count=%s 条件覆盖=%s 偏好=%s",
+        "suggestions 请求：engine=%s day=%s count=%s 条件覆盖=%s 偏好=%s",
         request.engine,
+        day.isoformat(),
         request.count,
         sorted(key for key, value in (conditions or {}).items() if value not in (None, "", [], False)),
         bool(note),
     )
 
     try:
+        # 日期越界先说清楚：过去的日子排不出东西，"两周以后"则是不该在这一层解决的需求。
+        # 放在引擎分支之前，两个引擎共用同一道门。
+        rules.ensure_plannable(day, now.date())
         if request.engine == "llm":
-            # 先按条件算出"今天还剩哪些可活动时段"，把这张时间表交给模型，
+            # 先按条件算出"那天还剩哪些可活动时段"，把这张时间表交给模型，
             # 让它只负责挑时间与活动，而不是自己算窗口减免打扰减冲突。
             settings = service.resolve_conditions(user["id"], conditions)
-            now = rules.now_local()
-            day = now.date()
             busy = service.busy_of_day(user["id"], day)
             count = request.count or settings["daily_target"]
             drafts, explanation, dropped = planner.plan(
@@ -336,10 +386,13 @@ def suggestions(
             feasible = len(drafts)
         else:
             drafts, feasible, settings = service.suggest_day(
-                user["id"], request.count, conditions
+                user["id"], request.count, conditions, day
             )
             prefix = f"考虑到你说的「{note}」，" if note else ""
-            explanation = f"{prefix}按你的可活动时段排了 {feasible} 次，已经避开免打扰时间。"
+            explanation = (
+                f"{prefix}{rules.day_label(day, now.date())}"
+                f"按你的可活动时段排了 {feasible} 次，已经避开免打扰时间。"
+            )
     except planner.LlmUnavailable as exc:
         # 用户明确选了真实模型，就如实报错，不要偷偷换成规则引擎
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
@@ -357,6 +410,7 @@ def suggestions(
         "explanation": explanation,
         "notice": notice,
         "mode": request.engine,
+        "day": day.isoformat(),
         "dropped": dropped,
     }
 

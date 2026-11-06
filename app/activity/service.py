@@ -225,6 +225,49 @@ def busy_of_day(user_id: int, day: date) -> list[dict]:
     return list_day(user_id, day)
 
 
+def overview_days(user_id: int, start: date, days: int) -> list[dict]:
+    """从 ``start`` 起连续 ``days`` 天，每天各安排了几条。
+
+    页面顶部那条日期需要的是"哪天有安排、做了几条"，不是每天的完整列表：
+    按天各查一次 ``list_day`` 是 15 次往返，这里一条 GROUP BY 就够。
+    空着的日子也要返回（计数全为 0），否则前端还得自己补日期。
+    """
+    span = max(1, min(int(days), rules.MAX_PLAN_DAYS + 1))
+    end = start + timedelta(days=span - 1)
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT substr(scheduled_at, 1, 10) AS day, status,
+                   COUNT(*) AS rows_count,
+                   SUM(CASE WHEN postponed_from IS NULL THEN 1 ELSE 0 END) AS originals
+            FROM activities
+            WHERE user_id = ? AND substr(scheduled_at, 1, 10) BETWEEN ? AND ?
+            GROUP BY day, status
+            """,
+            (user_id, start.isoformat(), end.isoformat()),
+        ).fetchall()
+
+    buckets: dict[str, dict] = {}
+    for row in rows:
+        item = buckets.setdefault(
+            row["day"],
+            {"date": row["day"], "total": 0, "planned": 0, "completed": 0,
+             "postponed": 0, "skipped": 0},
+        )
+        item[row["status"]] = item.get(row["status"], 0) + int(row["rows_count"])
+        # "一共计划几条"沿用周统计口径：只数原始条目，推迟产生的替代条目不重复计
+        item["total"] += int(row["originals"] or 0)
+
+    return [
+        buckets.get(
+            (start + timedelta(days=offset)).isoformat(),
+            {"date": (start + timedelta(days=offset)).isoformat(), "total": 0,
+             "planned": 0, "completed": 0, "postponed": 0, "skipped": 0},
+        )
+        for offset in range(span)
+    ]
+
+
 def _owned(conn, user_id: int, activity_id: int) -> dict:
     """取本人的活动；不存在或不属于本人一律 404，不区分"没有"和"不是你的"。"""
     row = conn.execute(
@@ -308,7 +351,7 @@ def _log_event(
 
 
 def generate_day(user_id: int, day: date, force: bool = False) -> dict:
-    """按当前设置生成当天安排。
+    """按当前设置生成某一天的安排（默认调用方传今天，也可以往前排）。
 
     当天已经有任何记录就不再生成，除非 ``force=true``。这样"点两次生成"不会变成六条；
     也不能只看 ``planned``——全部做完之后再点一次生成，旧逻辑会认为"今天还空着"，
@@ -316,14 +359,17 @@ def generate_day(user_id: int, day: date, force: bool = False) -> dict:
     """
     settings = get_settings(user_id)
     now = rules.now_local()
+    # 日期本身就是越界的（过去的日子、两周以后），先说清楚，别让它变成"没有可用时段"
+    rules.ensure_plannable(day, now.date())
 
     with get_conn() as conn:
         existing = _load_day(conn, user_id, day)
         if existing and not force:
             return {
                 "created": 0,
+                "day": day.isoformat(),
                 "activities": existing,
-                "notice": "今天已经有安排了，未重复生成。需要重排可以重建。",
+                "notice": f"{rules.day_label(day, now.date())}已经有安排了，未重复生成。需要重排可以重建。",
             }
 
         if force:
@@ -360,24 +406,28 @@ def generate_day(user_id: int, day: date, force: bool = False) -> dict:
     notice = ""
     if feasible < settings["daily_target"]:
         notice = f"可用时间只够安排 {feasible} 次，已按 {feasible} 次生成。"
-    return {"created": len(drafts), "activities": activities, "notice": notice}
+    return {"created": len(drafts), "day": day.isoformat(), "activities": activities, "notice": notice}
 
 
 def suggest_day(
     user_id: int,
     count: int | None = None,
     conditions: dict | None = None,
+    day: date | None = None,
 ) -> tuple[list[rules.Draft], int, dict]:
     """只算不存（规则引擎）。Agent 与"生成建议"按钮共用这一条路径。
 
     ``conditions`` 是本次生成的临时条件（见 ``resolve_conditions``）；
     不传就和以前一样，完全按已保存的设置算。
+    ``day`` 是目标日期，不传就是今天 —— 往前规划时占用判断也要看那一天。
     """
     settings = resolve_conditions(user_id, conditions)
-    day = rules.now_local().date()
-    busy = busy_of_day(user_id, day)
+    now = rules.now_local()
+    target = day or now.date()
+    rules.ensure_plannable(target, now.date())
+    busy = busy_of_day(user_id, target)
     drafts, feasible = rules.plan_day(
-        settings, day, busy, rules.now_local(), count or settings["daily_target"]
+        settings, target, busy, now, count or settings["daily_target"]
     )
     return drafts, feasible, settings
 
@@ -391,6 +441,10 @@ def confirm(user_id: int, items: list[dict]) -> dict:
     settings = get_settings(user_id)
     now = rules.now_local()
     stamp = int(time.time())
+    # 建议永远属于某一天，但那是哪一天由每条的 scheduled_at 决定（可能是未来某天）。
+    # 以前这里写死 ``now.date()``，于是确认"明天"的建议后返回的是今天的列表 ——
+    # 页面上什么都不出现，看起来像保存失败了。取第一条所在的日期，逐条校验时也会用到。
+    day = rules.parse_dt(items[0]["scheduled_at"]).date()
 
     with get_conn() as conn:
         for index, item in enumerate(items, start=1):
@@ -419,7 +473,8 @@ def confirm(user_id: int, items: list[dict]) -> dict:
 
         return {
             "saved": len(items),
-            "activities": _load_day(conn, user_id, now.date()),
+            "day": day.isoformat(),
+            "activities": _load_day(conn, user_id, day),
         }
 
 

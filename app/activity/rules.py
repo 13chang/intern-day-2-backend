@@ -26,6 +26,9 @@ STEP_MIN = 5
 POSTPONE_GAP_MIN = 30
 # 一条活动的默认时长（分钟）
 DEFAULT_DURATION_MIN = 5
+# 最多能提前几天规划。再远排出来的东西没有参考价值（作息、会议都还没定），
+# 而且"给三个月后的每天排三条"这种请求会把库撑爆。
+MAX_PLAN_DAYS = 14
 
 # 活动库：只用轻量、无医疗表述的说法。
 # 任务书明确不要运动处方、治疗方案或需要专业指导的动作。
@@ -92,6 +95,50 @@ def parse_dt(text: str) -> datetime:
 def iso(value: datetime) -> str:
     """落库格式：2026-11-06T10:30:00+08:00。带偏移，换时区也不产生歧义。"""
     return value.isoformat(timespec="seconds")
+
+
+WEEKDAY_LABELS = "一二三四五六日"
+
+
+def day_label(day: date, today: date | None = None) -> str:
+    """把日期说成人话：今天 / 明天 / 后天 / 11 月 8 日（周六）。
+
+    提示语里写死"今天"在往前规划时全是错的：用户明明选了 11 月 8 日，
+    报错却说"今天剩余的可活动时间不足"，读起来像系统没收到他选的日期。
+    所有面向用户的日期措辞统一走这里。
+    """
+    base = today or now_local().date()
+    span = (day - base).days
+    weekday = WEEKDAY_LABELS[day.weekday()]
+    if span == 0:
+        return "今天"
+    if span == 1:
+        return "明天"
+    if span == 2:
+        return "后天"
+    return f"{day.month} 月 {day.day} 日（周{weekday}）"
+
+
+def ensure_plannable(day: date, today: date | None = None) -> None:
+    """目标日期必须落在 [今天, 今天 + MAX_PLAN_DAYS]。
+
+    过去的日期排不出东西（``free_ranges`` 会把整段都当成"已经过去"），
+    与其让用户看到"没有可用时段"，不如直接说清楚是日期的问题。
+    往前规划也要有个上限，否则一次请求就能写十几年的数据。
+    """
+    base = today or now_local().date()
+    if day < base:
+        raise RuleViolation(
+            "PAST_DAY",
+            f"{day.isoformat()} 已经过去了，不能给过去的日期安排活动。",
+        )
+    span = (day - base).days
+    if span > MAX_PLAN_DAYS:
+        latest = base + timedelta(days=MAX_PLAN_DAYS)
+        raise RuleViolation(
+            "DAY_TOO_FAR",
+            f"最多只能规划到 {MAX_PLAN_DAYS} 天后（{latest.isoformat()}）。",
+        )
 
 
 # ---------------------------------------------------------------- 区间运算
@@ -354,10 +401,12 @@ def plan_day(
     free = free_ranges(settings, day, busy, now)
     total = int(sum((end - start).total_seconds() for start, end in free) // 60)
     capacity = total // MIN_ITEM_MIN
+    # 措辞跟着目标日期走：往前规划时写"今天"会让人以为日期没生效
+    label = day_label(day, now.date())
     if capacity <= 0:
         raise RuleViolation(
             "NO_SLOT_AVAILABLE",
-            "今天剩余的可活动时间不足，无法安排活动。可以放宽可活动时段，或减少每天次数。",
+            f"{label}剩余的可活动时间不足，无法安排活动。可以放宽可活动时段，或减少每天次数。",
         )
 
     want = min(max(int(count), 1), capacity)
@@ -398,7 +447,7 @@ def plan_day(
     drafts = kept
 
     if not drafts:
-        raise RuleViolation("NO_SLOT_AVAILABLE", "今天剩余的可活动时间不足，无法安排活动。")
+        raise RuleViolation("NO_SLOT_AVAILABLE", f"{label}剩余的可活动时间不足，无法安排活动。")
     return drafts, len(drafts)
 
 

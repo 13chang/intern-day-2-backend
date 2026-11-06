@@ -125,7 +125,7 @@ def default_completer() -> Completer:
 
 def _fmt_ranges(ranges: list[tuple]) -> str:
     if not ranges:
-        return "（今天没有剩余可用时段）"
+        return "（没有剩余可用时段）"
     return "、".join(f"{start:%H:%M}-{end:%H:%M}" for start, end in ranges)
 
 
@@ -135,16 +135,17 @@ def _free_ranges(settings: dict, day, busy: list[dict], now) -> list[tuple]:
     两件事在这里一次说清：
 
     - 交集为空（工作时段和可活动时段没搭上）→ ``NO_ALLOWED_RANGE``，指向配置本身；
-    - 交集有、但剩下的都被占满或已经过去 → ``NO_SLOT_AVAILABLE``，指向今天的时间。
+    - 交集有、但剩下的都被占满或已经过去 → ``NO_SLOT_AVAILABLE``，指向那天的时间。
 
     这两种都不该说成"模型给的时间不满足条件"：模型压根没被调用。
     """
     free = rules.free_ranges(settings, day, busy, now)
     if not free:
+        label = rules.day_label(day, now.date())
         raise rules.RuleViolation(
             "NO_SLOT_AVAILABLE",
-            "今天这些时段剩下的时间已经被安排占满，或者已经过去了，没有能放活动的位置。"
-            "可以换一个更宽的时段，或者先处理掉今天的安排。",
+            f"{label}这些时段剩下的时间已经被安排占满，或者已经过去了，没有能放活动的位置。"
+            f"可以换一个更宽的时段，或者先处理掉{label}的安排。",
         )
     return free
 
@@ -180,7 +181,23 @@ def build_prompt(
         )
         or "（没有）"
     )
-    weekday = "一二三四五六日"[day.weekday()]
+    weekday = rules.WEEKDAY_LABELS[day.weekday()]
+    # 排"今天"和排"以后某天"要给的约束不一样：未来那天不存在"已经过去"，
+    # 硬塞一句"不早于现在"只会让模型以为只能在今天剩下的时间附近挑。
+    is_today = day == now.date()
+    if is_today:
+        when_line = f"今天是 {day.isoformat()}（周{weekday}），现在是 {now:%H:%M}。"
+        ask_line = f"用户希望今天安排 {count} 次短暂活动，每次 5 分钟。"
+        cut_line = "区间已扣掉免打扰时段、已有安排和已经过去的时间。"
+        time_rule = "1. time 必须是上面某个区间内的 HH:MM，且不早于现在；"
+    else:
+        when_line = (
+            f"要安排的是 {day.isoformat()}（周{weekday}），还没到"
+            f"（今天是 {now.date().isoformat()}，现在 {now:%H:%M}）。"
+        )
+        ask_line = f"用户希望提前在那一天安排 {count} 次短暂活动，每次 5 分钟。"
+        cut_line = "区间已扣掉免打扰时段和那一天已有的安排。"
+        time_rule = "1. time 必须是上面某个区间内的 HH:MM；那一天还没到，不需要考虑「已经过去」；"
     # 没填偏好就把整段去掉。留一个"（没特别说明）"的占位符，模型会把它当内容抄进
     # explanation —— 实际出现过「未说明偏好，安排两次轻活动…」，读起来像系统日志泄漏。
     preference = note.strip()
@@ -199,12 +216,12 @@ def build_prompt(
 
     return f"""你是「工作间隙活动助手」的排程模块。只输出 JSON，不要任何解释性文字、不要 Markdown。
 
-今天是 {day.isoformat()}（周{weekday}），现在是 {now:%H:%M}。
-用户希望今天安排 {count} 次短暂活动，每次 5 分钟。
+{when_line}
+{ask_line}
 
 【只能在这些区间内挑时间】
 {_fmt_ranges(free)}
-区间已扣掉免打扰时段、已有安排和已经过去的时间。每条活动占用 5 分钟，
+{cut_line}每条活动占用 5 分钟，
 所以挑的起点必须在区间结束前至少 5 分钟。
 
 【已有的安排】
@@ -222,7 +239,7 @@ def build_prompt(
                    "reason": "为什么安排在这个时间，40 字以内"}}]}}
 
 【硬约束】
-1. time 必须是上面某个区间内的 HH:MM，且不早于现在；
+{time_rule}
 2. 相邻两条之间至少间隔 15 分钟；
 3. 最多 {min(count, MAX_ITEMS)} 条；区间不够就少给，不要凑数；
 4. 只描述轻微、无需器械的活动，不写运动处方、不提疾病、不做健康评价；

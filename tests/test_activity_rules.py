@@ -325,3 +325,58 @@ def test_no_overlap_when_windows_sit_on_both_sides() -> None:
         rules.free_ranges(settings, DAY, [], NOW)
 
     assert "上班前和下班后" in exc.value.message
+
+
+# ---------------------------------------------------------------- 往前规划
+
+def test_day_label_uses_relative_words_only_when_it_helps() -> None:
+    """近三天说"今天/明天/后天"，再远就说日期 —— "大后天""外后天"没人这么讲。"""
+    assert rules.day_label(DAY, DAY) == "今天"
+    assert rules.day_label(DAY + timedelta(days=1), DAY) == "明天"
+    assert rules.day_label(DAY + timedelta(days=2), DAY) == "后天"
+    assert rules.day_label(DAY + timedelta(days=5), DAY) == "11 月 11 日（周三）"
+
+
+def test_ensure_plannable_allows_today_through_the_limit() -> None:
+    """边界两端都要能用：今天本身，以及恰好第 14 天。"""
+    rules.ensure_plannable(DAY, DAY)
+    rules.ensure_plannable(DAY + timedelta(days=rules.MAX_PLAN_DAYS), DAY)
+
+
+def test_ensure_plannable_rejects_past_day() -> None:
+    with pytest.raises(rules.RuleViolation) as exc:
+        rules.ensure_plannable(DAY - timedelta(days=1), DAY)
+    assert exc.value.code == "PAST_DAY"
+    assert "已经过去" in exc.value.message
+
+
+def test_ensure_plannable_rejects_day_beyond_the_limit() -> None:
+    """提示里必须写清最远能排到哪天，否则用户只知道自己被拒了。"""
+    latest = DAY + timedelta(days=rules.MAX_PLAN_DAYS)
+    with pytest.raises(rules.RuleViolation) as exc:
+        rules.ensure_plannable(latest + timedelta(days=1), DAY)
+    assert exc.value.code == "DAY_TOO_FAR"
+    assert latest.isoformat() in exc.value.message
+
+
+def test_plan_day_for_tomorrow_ignores_the_current_clock() -> None:
+    """排明天不该受"现在几点"影响：半夜 23:30 也要能排满明天的时段。
+
+    这是 free_ranges 里 floor = now + 1min 那行的边界：
+    如果 floor 没和"当天"绑定，排未来某天时整段都会被当成已经过去。
+    """
+    tomorrow = DAY + timedelta(days=1)
+    late = datetime(2026, 11, 6, 23, 30, tzinfo=TZ8)
+    drafts, feasible = rules.plan_day(SETTINGS, tomorrow, [], late, 3)
+    assert feasible == 3
+    assert all(draft.at.date() == tomorrow for draft in drafts)
+
+
+def test_plan_day_message_names_the_target_day() -> None:
+    """排明天却提示"今天剩余的可活动时间不足"，用户会以为选的日期没生效。"""
+    tomorrow = DAY + timedelta(days=1)
+    settings = {**SETTINGS, "quiet_start": "00:00", "quiet_end": "23:59"}
+    with pytest.raises(rules.RuleViolation) as exc:
+        rules.plan_day(settings, tomorrow, [], NOW, 3)
+    assert exc.value.code == "NO_SLOT_AVAILABLE"
+    assert exc.value.message.startswith("明天")

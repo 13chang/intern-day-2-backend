@@ -18,6 +18,9 @@ from fastapi.testclient import TestClient
 
 # Agent 端点在 app 导入时就会构建，所以必须在导入 app.main 之前定死模式：
 # 即使开发机环境里配了真实模型密钥，测试也只用 Mock，不产生任何模型调用费用。
+# 两个变量都设，是因为 MODEL_MODE 优先级更高 —— 只设 APP_LLM_MODE 的话，
+# shell 里导出过 MODEL_MODE=real 就会让测试意外连上真实模型。
+os.environ["MODEL_MODE"] = "mock"
 os.environ["APP_LLM_MODE"] = "mock"
 
 # Mock 默认按打字速度每 6 字停 25ms；测试不需要看打字效果，

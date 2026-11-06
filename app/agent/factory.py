@@ -7,6 +7,7 @@ Agent 只在这里创建一次，``add_agent_framework_fastapi_endpoint`` 注册
 
 from __future__ import annotations
 
+import logging
 import os
 
 from agent_framework import Agent
@@ -14,6 +15,8 @@ from agent_framework import Agent
 from app.agent.config import LlmSettings, load_llm_settings
 from app.agent.mock import MockChatClient
 from app.agent.tools import list_my_todos
+
+logger = logging.getLogger(__name__)
 
 AGENT_NAME = "todo-assistant"
 
@@ -67,15 +70,32 @@ def _mock_chunk_delay() -> float | None:
 
 
 def build_agent(settings: LlmSettings | None = None) -> Agent:
-    """按当前环境配置构造 Agent。"""
+    """按当前环境配置构造 Agent。
+
+    这是 mock / real 的**唯一开关点**，由 ``MODEL_MODE``（或兼容的 ``APP_LLM_MODE``）决定。
+    """
     resolved = settings or load_llm_settings()
 
     if resolved.is_mock:
+        logger.warning("MODEL_MODE=mock：本地假模型，回复不是真实模型产出（%s）", resolved.reason)
         client = MockChatClient(chunk_delay=_mock_chunk_delay())
     else:
         # 放在分支里导入：Mock 场景不需要加载 openai 相关依赖
+        #
+        # 必须用 OpenAIChatCompletionClient（POST /chat/completions），
+        # 不能用 OpenAIChatClient（POST /responses）。
+        # DeepSeek 的「OpenAI 兼容层」只实现了 chat/completions：
+        # 用 Responses API 时第一轮工具调用正常，第二轮把工具结果回传会报
+        # 400 "No tool call found for tool output with call_id=..."。
+        # 原因是 Responses 协议把工具结果作为独立 input item，DeepSeek 不认这种结构。
+        # 接国产 OpenAI 兼容服务（DeepSeek / 通义 / Moonshot / 智谱）一律用这个类。
         from agent_framework.openai import OpenAIChatCompletionClient
 
+        logger.info(
+            "MODEL_MODE=real：真实模型 model=%s base_url=%s（密钥不进日志）",
+            resolved.model,
+            resolved.base_url,
+        )
         client = OpenAIChatCompletionClient(
             model=resolved.model,
             api_key=resolved.api_key,

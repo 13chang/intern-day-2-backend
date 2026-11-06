@@ -142,8 +142,8 @@ def install_agent_endpoint(app: FastAPI) -> None:
     if settings.is_mock:
         logger.warning(
             "Agent 运行在 Mock 模式（%s）：链路是真的，模型回复是本地规则生成的。"
-            "配置 APP_LLM_BASE_URL / APP_LLM_MODEL / APP_LLM_API_KEY 后可切到真实模型。",
+            "把 .env 里的 MODEL_MODE 改成 real 并配好 OPENAI_* 三项即可切到真实模型。",
             settings.reason,
         )
     else:
-        logger.info("Agent 已接入真实模型：model=%s", settings.model)
+        logger.info("Agent 已接入真实模型：model=%s（密钥不进日志）", settings.model)

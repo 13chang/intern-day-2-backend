@@ -14,10 +14,15 @@ services:
       SEED_USERNAME: "${SEED_USERNAME:-demo}"
       SEED_PASSWORD: "${SEED_PASSWORD:-demo1234}"
       SEED_DISPLAY_NAME: "${SEED_DISPLAY_NAME:-练习用户}"
-      # 第三天：模型访问条件。密钥只从运行环境注入，
-      # 不写进代码、不写进镜像构建参数、不暴露给前端。
-      # 三项都为空的默认行为是 auto → Mock 模式。
-      APP_LLM_MODE: "${APP_LLM_MODE:-auto}"
+      # 模型模式：只改 .env 里的 MODEL_MODE（mock / real / auto），代码不用动。
+      # 默认是 mock —— clone 下来直接起不会意外调用真实模型、烧掉额度。
+      # 密钥只从运行环境注入，不写进代码、不写进镜像构建参数、不暴露给前端。
+      MODEL_MODE: "${MODEL_MODE:-mock}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      OPENAI_BASE_URL: "${OPENAI_BASE_URL:-}"
+      OPENAI_MODEL: "${OPENAI_MODEL:-}"
+      # 兼容第三天的旧变量名（留空即可，MODEL_MODE 优先）
+      APP_LLM_MODE: "${APP_LLM_MODE:-}"
       APP_LLM_BASE_URL: "${APP_LLM_BASE_URL:-}"
       APP_LLM_MODEL: "${APP_LLM_MODEL:-}"
       APP_LLM_API_KEY: "${APP_LLM_API_KEY:-}"

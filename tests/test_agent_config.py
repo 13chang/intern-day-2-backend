@@ -28,6 +28,27 @@ from app.agent.mock import (
 # ------------------------------------------------------------------ 配置判定
 
 
+@pytest.fixture(autouse=True)
+def _isolate_model_env(monkeypatch):
+    """每个配置用例都从干净环境开始。
+
+    ``conftest.py`` 为了保证 app.main 导入时不连真实模型，在模块级设了
+    ``MODEL_MODE=mock``。但配置测试要自己控制模式，不清掉的话这个全局值
+    会盖住用例里设置的 ``APP_LLM_MODE``，让判定测试全部假通过。
+    """
+    for name in (
+        "MODEL_MODE",
+        "APP_LLM_MODE",
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "OPENAI_MODEL",
+        "APP_LLM_API_KEY",
+        "APP_LLM_BASE_URL",
+        "APP_LLM_MODEL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
 def test_settings_default_to_mock_without_credentials(monkeypatch) -> None:
     """三项模型配置都没有时，auto 模式退回 Mock，并说明原因。"""
     monkeypatch.delenv("APP_LLM_MODE", raising=False)
@@ -69,6 +90,87 @@ def test_settings_reject_unknown_mode(monkeypatch) -> None:
 
     with pytest.raises(LlmConfigError):
         load_llm_settings()
+
+
+# ------------------------------------- MODEL_MODE 开关（对接真实模型后新增）
+
+
+def _deepseek_credentials(monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-placeholder")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://api.deepseek.com/v1")
+    monkeypatch.setenv("OPENAI_MODEL", "deepseek-chat")
+
+
+def test_model_mode_real_maps_to_openai(monkeypatch) -> None:
+    """MODEL_MODE=real 是给使用者看的叫法，内部对应 openai 兼容端点。"""
+    monkeypatch.setenv("MODEL_MODE", "real")
+    _deepseek_credentials(monkeypatch)
+
+    settings = load_llm_settings()
+
+    assert settings.mode == "openai"
+    assert settings.is_mock is False
+    assert settings.model == "deepseek-chat"
+    assert "real" in settings.reason
+
+
+def test_model_mode_mock_keeps_mock_even_with_credentials(monkeypatch) -> None:
+    """配了密钥也照样跑 Mock —— 开关优先级高于凭证是否齐全。"""
+    monkeypatch.setenv("MODEL_MODE", "mock")
+    _deepseek_credentials(monkeypatch)
+
+    settings = load_llm_settings()
+
+    assert settings.mode == "mock"
+    assert "MODEL_MODE=mock" in settings.reason
+
+
+def test_model_mode_takes_priority_over_legacy_name(monkeypatch) -> None:
+    """两个开关都在时以 MODEL_MODE 为准，避免 compose 和 .env 各说一套。"""
+    monkeypatch.setenv("MODEL_MODE", "mock")
+    monkeypatch.setenv("APP_LLM_MODE", "openai")
+    _deepseek_credentials(monkeypatch)
+
+    assert load_llm_settings().is_mock is True
+
+
+def test_auto_mode_accepts_openai_prefixed_credentials(monkeypatch) -> None:
+    """只写 OPENAI_* 这一套名字也能自动进入真实模型。"""
+    monkeypatch.setenv("MODEL_MODE", "auto")
+    _deepseek_credentials(monkeypatch)
+
+    settings = load_llm_settings()
+
+    assert settings.mode == "openai"
+    assert settings.base_url == "https://api.deepseek.com/v1"
+
+
+def test_real_mode_without_credentials_fails_fast(monkeypatch) -> None:
+    """强制 real 却缺配置时直接报错，不静默降级成 Mock。"""
+    monkeypatch.setenv("MODEL_MODE", "real")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://api.deepseek.com/v1")
+    monkeypatch.setenv("OPENAI_MODEL", "deepseek-chat")
+
+    with pytest.raises(LlmConfigError, match="API_KEY"):
+        load_llm_settings()
+
+
+def test_legacy_credential_names_win_when_both_are_set(monkeypatch) -> None:
+    monkeypatch.setenv("MODEL_MODE", "real")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-name")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://api.deepseek.com/v1")
+    monkeypatch.setenv("OPENAI_MODEL", "deepseek-chat")
+    monkeypatch.setenv("APP_LLM_MODEL", "legacy-model")
+
+    assert load_llm_settings().model == "legacy-model"
+
+
+def test_reason_never_contains_api_key(monkeypatch) -> None:
+    """/agent/info 会展示 reason，不能把密钥带出去。"""
+    monkeypatch.setenv("MODEL_MODE", "real")
+    _deepseek_credentials(monkeypatch)
+
+    assert "sk-test-placeholder" not in load_llm_settings().reason
 
 
 # ------------------------------------------------------- Mock 客户的决策逻辑

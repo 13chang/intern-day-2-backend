@@ -288,3 +288,78 @@ def test_settings_are_per_user(client: TestClient, demo: dict, other: dict) -> N
     save_settings(client, demo["headers"], daily_target=2)
     other_settings = client.get("/activity/settings", headers=other["headers"]).json()
     assert other_settings["daily_target"] == 3
+
+
+# ---------------------------------------------------------------- 同一时刻不能出现两条
+
+def test_completed_slot_is_not_offered_again(
+    client: TestClient, demo: dict, frozen
+) -> None:
+    """做完一条之后，那个时刻不能再被建议。
+
+    回归用例。``busy`` 以前只算 ``planned``，于是"已完成"的时刻被当成空闲，
+    建议面板又给一次同一个时间，确认后页面上就是两行 14:50（一行 rule、一行 agent）。
+    """
+    save_settings(client, demo["headers"])
+    items = client.post("/activity/generate", headers=demo["headers"]).json()["activities"]
+    done_at = items[0]["scheduled_at"]
+    assert client.post(
+        f"/activity/{items[0]['id']}/complete", headers=demo["headers"]
+    ).status_code == 200
+
+    body = client.post(
+        "/activity/suggestions", headers=demo["headers"], json={"count": 3}
+    ).json()
+
+    assert body["suggestions"], body
+    assert all(item["scheduled_at"] != done_at for item in body["suggestions"])
+
+
+def test_confirm_rejects_duplicate_of_completed_slot(
+    client: TestClient, demo: dict, frozen
+) -> None:
+    """手工提交一个已完成时刻的草稿，也必须被拒 —— 否则前端能绕过。"""
+    save_settings(client, demo["headers"])
+    items = client.post("/activity/generate", headers=demo["headers"]).json()["activities"]
+    done = items[0]
+    client.post(f"/activity/{done['id']}/complete", headers=demo["headers"])
+
+    response = client.post(
+        "/activity/confirm",
+        headers=demo["headers"],
+        json={
+            "items": [
+                {
+                    "scheduled_at": done["scheduled_at"],
+                    "activity_type": "walk",
+                    "title": "重复的一条",
+                    "description": "",
+                    "duration_min": 5,
+                }
+            ]
+        },
+    )
+
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"].startswith("第 1 条")
+
+
+def test_generate_after_all_completed_does_not_duplicate(
+    client: TestClient, demo: dict, frozen
+) -> None:
+    """全部做完之后再点「生成安排」，不能在同一批时刻上再排一遍。
+
+    旧逻辑只把 ``planned`` 当成"今天已有安排"，全完成后会认为今天还空着，
+    于是 10:45 / 14:15 / 16:45 再来一轮，页面上每行都出现两次。
+    """
+    save_settings(client, demo["headers"])
+    items = client.post("/activity/generate", headers=demo["headers"]).json()["activities"]
+    for item in items:
+        client.post(f"/activity/{item['id']}/complete", headers=demo["headers"])
+
+    again = client.post("/activity/generate", headers=demo["headers"]).json()
+
+    assert again["created"] == 0
+    assert "已经" in again["notice"]
+    times = [item["scheduled_at"] for item in again["activities"]]
+    assert len(times) == len(set(times))

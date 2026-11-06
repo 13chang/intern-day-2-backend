@@ -210,13 +210,18 @@ def list_day(user_id: int, day: date) -> list[dict]:
         return _load_day(conn, user_id, day)
 
 
-def planned_of_day(user_id: int, day: date) -> list[dict]:
-    """当天已占用（只算待执行的）。
+def busy_of_day(user_id: int, day: date) -> list[dict]:
+    """当天"这个时刻已经有安排"的记录，用于排程与冲突校验。
 
-    已完成/已跳过/已推迟的条目不占时间：用户已经处理过了，把它们也算成"冲突"
-    会让下午再也排不进东西。
+    口径是**当天所有记录，不分状态**。以前只算 ``planned``，理由是"完成/跳过/推迟的
+    不该继续占时间"。但它带来一个直接可见的后果：同一天会排出两条同一时刻的安排 ——
+    上午生成 14:50 那条做完之后，14:50 又被算成空闲，建议面板再给一次 14:50，
+    确认保存后就变成列表里两条 14:50（一条 rule、一条 agent），用户看到的就是重复。
+
+    为什么不怕"排不进东西"：``free_ranges`` 对每条记录只屏蔽"中心 ± (时长+10 分钟)"，
+    一条记录最多挡住半小时，不会把整个下午占死；真把全天都排满了，本来也不该再塞。
     """
-    return [row for row in list_day(user_id, day) if row["status"] == "planned"]
+    return list_day(user_id, day)
 
 
 def _owned(conn, user_id: int, activity_id: int) -> dict:
@@ -293,15 +298,16 @@ def _log_event(
 def generate_day(user_id: int, day: date, force: bool = False) -> dict:
     """按当前设置生成当天安排。
 
-    已经有待执行的活动就不再生成，除非 ``force=true``。这样"点两次生成"不会变成六条。
+    当天已经有任何记录就不再生成，除非 ``force=true``。这样"点两次生成"不会变成六条；
+    也不能只看 ``planned``——全部做完之后再点一次生成，旧逻辑会认为"今天还空着"，
+    于是在同一批时刻上再排一遍，页面上就成了两行同一时间。
     """
     settings = get_settings(user_id)
     now = rules.now_local()
 
     with get_conn() as conn:
         existing = _load_day(conn, user_id, day)
-        pending = [row for row in existing if row["status"] == "planned"]
-        if pending and not force:
+        if existing and not force:
             return {
                 "created": 0,
                 "activities": existing,
@@ -309,7 +315,8 @@ def generate_day(user_id: int, day: date, force: bool = False) -> dict:
             }
 
         if force:
-            # 只清待执行的：已完成/已推迟/已跳过是历史记录，删掉会让周统计对不上
+            # 只清待执行的：已完成/已推迟/已跳过是历史记录，删掉会让周统计对不上。
+            # 清完之后重排仍要避开这些历史时刻，否则又会排到同一时间。
             conn.execute(
                 """
                 DELETE FROM activities
@@ -317,9 +324,9 @@ def generate_day(user_id: int, day: date, force: bool = False) -> dict:
                 """,
                 (user_id, day.isoformat()),
             )
-            pending = []
+            existing = [row for row in existing if row["status"] != "planned"]
 
-        drafts, feasible = rules.plan_day(settings, day, pending, now, settings["daily_target"])
+        drafts, feasible = rules.plan_day(settings, day, existing, now, settings["daily_target"])
 
         stamp = int(time.time())
         for draft in drafts:
@@ -356,7 +363,7 @@ def suggest_day(
     """
     settings = resolve_conditions(user_id, conditions)
     day = rules.now_local().date()
-    busy = planned_of_day(user_id, day)
+    busy = busy_of_day(user_id, day)
     drafts, feasible = rules.plan_day(
         settings, day, busy, rules.now_local(), count or settings["daily_target"]
     )
@@ -377,11 +384,8 @@ def confirm(user_id: int, items: list[dict]) -> dict:
         for index, item in enumerate(items, start=1):
             moment = rules.parse_dt(item["scheduled_at"])
             day = moment.date()
-            busy = [
-                row
-                for row in _load_day(conn, user_id, day)
-                if row["status"] == "planned"
-            ]
+            # 不分状态：已完成的时刻也要拦住，否则会和已有记录叠成页面上两行同一时间
+            busy = _load_day(conn, user_id, day)
             try:
                 rules.validate_slot(settings, moment, day, busy, now)
             except rules.RuleViolation as exc:
@@ -469,7 +473,8 @@ def postpone(user_id: int, activity_id: int) -> dict:
             )
 
         day = rules.parse_dt(activity["scheduled_at"]).date()
-        busy = [row for row in _load_day(conn, user_id, day) if row["status"] == "planned"]
+        # 不分状态：新位置不能落在当天任何一条记录的时刻上（自己由 ignore_id 排除）
+        busy = _load_day(conn, user_id, day)
         not_before = rules.parse_dt(activity["scheduled_at"]) + timedelta(
             minutes=rules.POSTPONE_GAP_MIN
         )

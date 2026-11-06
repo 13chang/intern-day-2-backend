@@ -269,6 +269,38 @@ def test_llm_keeps_earlier_slot_when_model_returns_out_of_order(
     assert [item["scheduled_at"][11:16] for item in body["suggestions"]] == ["10:30"]
 
 
+def test_llm_does_not_reuse_a_completed_slot(
+    client: TestClient, demo: dict, frozen, llm
+) -> None:
+    """已完成的时刻对 llm 引擎同样不可用。
+
+    真实踩到的现象：规则引擎排的 14:50 做完之后，建议面板再给一次 14:50，
+    确认保存就多出一条同样的时间（source=agent），页面上并排两行。
+    """
+    save_settings(client, demo["headers"])
+    items = client.post("/activity/generate", headers=demo["headers"]).json()["activities"]
+    done = items[0]
+    assert client.post(
+        f"/activity/{done['id']}/complete", headers=demo["headers"]
+    ).status_code == 200
+    done_hhmm = done["scheduled_at"][11:16]
+
+    llm(
+        {
+            "suggestions": [
+                {"time": done_hhmm, "activity_type": "walk", "title": "同一时刻再来一条"},
+                {"time": "11:30", "activity_type": "water", "title": "空闲时刻"},
+            ]
+        }
+    )
+
+    status, body = suggest(client, demo["headers"], engine="llm", count=2)
+
+    assert status == 200, body
+    assert [item["scheduled_at"][11:16] for item in body["suggestions"]] == ["11:30"]
+    assert body["dropped"] == 1
+
+
 def test_llm_dedupes_same_time(client: TestClient, demo: dict, frozen, llm) -> None:
     """同一个时间给两条，只留一条 —— 否则用户会勾到两条一模一样的安排。"""
     save_settings(client, demo["headers"])

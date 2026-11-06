@@ -325,7 +325,7 @@ def suggestions(
             settings = service.resolve_conditions(user["id"], conditions)
             now = rules.now_local()
             day = now.date()
-            busy = service.planned_of_day(user["id"], day)
+            busy = service.busy_of_day(user["id"], day)
             count = request.count or settings["daily_target"]
             drafts, explanation, dropped = planner.plan(
                 settings, day, busy, now, count, note

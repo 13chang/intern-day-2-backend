@@ -534,6 +534,17 @@ invoke_agent todo-assistant  1723ms
 （全部做完之后再点「生成安排」，旧逻辑会认为今天还空着，于是在同一批时刻上再排一遍）；
 `POST /activity/generate?force=true` 清掉 `planned` 后重排，仍会避开留下的历史时刻。
 
+#### 数据库层的兜底
+
+`activities` 上有唯一索引 `ux_activity_user_slot (user_id, scheduled_at)`：
+同一用户同一时刻**写不进第二条**，粒度是"每个用户"，不影响别人的同一时刻。
+`_insert_activity()` 把 `IntegrityError` 翻成 `DUPLICATE_SLOT`（409），不会变成 500。
+
+索引单独建、单独容错（`db.init_db()` 里的 `UNIQUE_SLOT_INDEX`）：老库里如果有历史重复行，
+`CREATE UNIQUE INDEX` 会失败，这时只记一条 warning、不让应用起不来 ——
+清理掉重复行后重启，索引自动补上。这一层是防"以后新增写入路径时又漏一处"，
+应用层的 `busy_of_day()` 才是正常拦截点。
+
 ### 12.3 接口
 
 前缀 `/activity`，全部需要 Bearer 令牌；用户范围由登录会话决定，不接受请求体里的用户标识。
@@ -577,7 +588,7 @@ invoke_agent todo-assistant  1723ms
 
 ```bash
 uv run pytest -q
-# 242 passed
+# 244 passed
 ```
 
 新增四个文件：
@@ -585,7 +596,7 @@ uv run pytest -q
 - `tests/test_activity_rules.py`（23 个用例）：窗口裁剪、免打扰把一段切成两段、跨天免打扰、
   排程避开免打扰、时间不足时少排、当天没空位、过去时间、窗口外、冲突、推迟排除自身、
   工作时段与可活动时段无交集、ISO 往返与时区补齐；
-- `tests/test_activity_api.py`（22 个用例）：设置默认值与校验，已完成时刻不再被建议或重复确认，全部完成后重复生成被拦、生成幂等、三个操作的状态流转与幂等、
+- `tests/test_activity_api.py`（24 个用例）：设置默认值与校验，唯一索引拦住同时刻第二条，已完成时刻不再被建议或重复确认，全部完成后重复生成被拦、生成幂等、三个操作的状态流转与幂等、
   推迟无时段时原条仍 `planned`、周统计四个数字、建议不落库、确认时免打扰被拒并带序号、
   跨用户 404 与数据隔离；
 - `tests/test_activity_llm.py`（29 个用例）：引擎可用性、模型产出经校验后才算数、

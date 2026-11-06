@@ -34,6 +34,9 @@ _STATUS_BY_CODE = {
     "NOT_FOUND": status.HTTP_404_NOT_FOUND,
     "INVALID_STATE": status.HTTP_409_CONFLICT,
     "NO_SLOT_AVAILABLE": status.HTTP_409_CONFLICT,
+    # 唯一索引兜底：同一时刻已经有记录了。正常流程不会走到（排程已避开），
+    # 走到就说明有某条写入路径没走 busy_of_day，这时宁可报错也不要静默重复。
+    "DUPLICATE_SLOT": status.HTTP_409_CONFLICT,
     # 用户选了真实模型引擎，但它排出来的时间全都不合条件：这是"当前排不出来"，
     # 不是请求写错了，所以用 409 而不是 422。
     "LLM_NO_VALID_SLOT": status.HTTP_409_CONFLICT,

@@ -6,11 +6,14 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
+
+logger = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DB_PATH = REPO_ROOT / "data" / "app.db"
@@ -92,6 +95,13 @@ CREATE TABLE IF NOT EXISTS activity_events (
 CREATE INDEX IF NOT EXISTS idx_activity_event_user ON activity_events(user_id, created_at);
 """
 
+# 同一用户同一时刻只能有一条记录。不放进 SCHEMA 是因为老库里可能已经有历史重复数据，
+# 那样 CREATE UNIQUE INDEX 会直接抛错、应用起不来。见 init_db。
+UNIQUE_SLOT_INDEX = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_activity_user_slot "
+    "ON activities(user_id, scheduled_at)"
+)
+
 
 def db_path() -> Path:
     """返回当前使用的数据库文件路径。"""
@@ -117,6 +127,20 @@ def get_conn() -> Iterator[sqlite3.Connection]:
 
 
 def init_db() -> None:
-    """建表，可重复执行。"""
+    """建表，可重复执行。
+
+    唯一索引单独建、单独容错：老库里如果留着同一时刻的重复记录（历史 bug 的产物），
+    ``CREATE UNIQUE INDEX`` 会失败。这里只记一条警告，不让应用因此起不来；
+    清理掉重复行之后重启，索引就会补上。
+    """
     with get_conn() as conn:
         conn.executescript(SCHEMA)
+
+    with get_conn() as conn:
+        try:
+            conn.execute(UNIQUE_SLOT_INDEX)
+        except sqlite3.IntegrityError:
+            logger.warning(
+                "activities 表里还有同一时刻的重复记录，唯一索引未建立；"
+                "清理后重启即可生效。应用层仍然会拦住新的重复（busy_of_day）。"
+            )

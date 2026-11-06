@@ -6,12 +6,14 @@
 
 from __future__ import annotations
 
+import sqlite3
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.activity import rules
+from app.db import get_conn
 
 TZ8 = timezone(timedelta(hours=8))
 NOW = datetime(2026, 11, 6, 9, 0, tzinfo=TZ8)
@@ -363,3 +365,48 @@ def test_generate_after_all_completed_does_not_duplicate(
     assert "已经" in again["notice"]
     times = [item["scheduled_at"] for item in again["activities"]]
     assert len(times) == len(set(times))
+
+
+def test_unique_index_blocks_second_row_at_the_same_moment(
+    client: TestClient, demo: dict, frozen
+) -> None:
+    """数据库层面兜底：同一用户同一时刻写不进第二条。
+
+    应用层的 ``busy_of_day`` 已经会避开，这一条是防"以后新增写入路径时又漏一处"——
+    唯一索引让重复在 SQL 层就失败，而不是等用户在页面上发现两行同一时间。
+    """
+    save_settings(client, demo["headers"])
+    items = client.post("/activity/generate", headers=demo["headers"]).json()["activities"]
+    taken = items[0]["scheduled_at"]
+
+    with pytest.raises(sqlite3.IntegrityError):
+        with get_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO activities
+                    (user_id, activity_type, title, description, scheduled_at,
+                     duration_min, created_at, updated_at)
+                VALUES (?, 'walk', '重复的一条', '绕过应用层直接插', ?, 5, 0, 0)
+                """,
+                (demo["id"], taken),
+            )
+
+
+def test_unique_index_allows_different_users_at_the_same_moment(
+    client: TestClient, demo: dict, other: dict, frozen
+) -> None:
+    """唯一索引的粒度是"每个用户"，不能把别的用户也挡了。"""
+    for who in (demo, other):
+        save_settings(client, who["headers"])
+        items = client.post("/activity/generate", headers=who["headers"]).json()["activities"]
+        assert items, who["username"]
+    demo_times = {
+        item["scheduled_at"]
+        for item in client.get("/activity/today", headers=demo["headers"]).json()
+    }
+    other_times = {
+        item["scheduled_at"]
+        for item in client.get("/activity/today", headers=other["headers"]).json()
+    }
+    assert demo_times and other_times
+    assert demo_times & other_times, "两个账号都被排到同一批时刻，说明互不影响"

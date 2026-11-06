@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import time
 from datetime import date, datetime, timedelta
 
@@ -251,27 +252,38 @@ def _insert_activity(
     postponed_from: int | None = None,
     postpone_count: int = 0,
 ) -> int:
-    cursor = conn.execute(
-        """
-        INSERT INTO activities
-            (user_id, activity_type, title, description, scheduled_at, duration_min,
-             status, source, postponed_from, postpone_count, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, 'planned', ?, ?, ?, ?, ?)
-        """,
-        (
-            user_id,
-            activity_type,
-            title,
-            description,
-            rules.iso(moment),
-            duration_min,
-            source,
-            postponed_from,
-            postpone_count,
-            stamp,
-            stamp,
-        ),
-    )
+    """写一条安排。同一用户同一时刻已经有时，由唯一索引兜底拦下。
+
+    应用层（``busy_of_day``）本来就不该走到这里，这一层是防"以后改代码时又漏了一处"：
+    数据库直接拒绝，比页面上出现两行同一时间要好得多。
+    """
+    try:
+        cursor = conn.execute(
+            """
+            INSERT INTO activities
+                (user_id, activity_type, title, description, scheduled_at, duration_min,
+                 status, source, postponed_from, postpone_count, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'planned', ?, ?, ?, ?, ?)
+            """,
+            (
+                user_id,
+                activity_type,
+                title,
+                description,
+                rules.iso(moment),
+                duration_min,
+                source,
+                postponed_from,
+                postpone_count,
+                stamp,
+                stamp,
+            ),
+        )
+    except sqlite3.IntegrityError as exc:
+        raise rules.RuleViolation(
+            "DUPLICATE_SLOT",
+            f"{moment:%H:%M} 已经有一条安排了，换一个时间。",
+        ) from exc
     return int(cursor.lastrowid)
 
 

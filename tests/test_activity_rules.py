@@ -223,3 +223,50 @@ def test_plan_day_returns_slot_when_two_short_ranges_remain() -> None:
     assert 0 < len(drafts) <= 2
     for draft in drafts:
         rules.validate_slot(settings, draft.at, DAY, [], NOW)
+
+
+# ---------------------------------------------------------------- 条件自相矛盾
+
+def test_plan_day_explains_windows_not_overlapping_work_hours() -> None:
+    """工作时段圈不住任何可活动时段时，要说"没重叠"，不能说"时间不足"。
+
+    真实来源：工作时段 09:00-10:00，可活动时段 11:00-17:00 / 18:00-22:30。
+    ``allowed_ranges`` 取的是交集，交集为空 —— 任何引擎都排不出东西。
+    以前这里报 "今天剩余的可活动时间不足"，用户会以为是自己"排得太满"。
+    """
+    settings = {
+        **SETTINGS,
+        "work_start": "09:00",
+        "work_end": "10:00",
+        "windows": [
+            {"label": "morning", "start": "11:00", "end": "17:00"},
+            {"label": "afternoon", "start": "18:00", "end": "22:30"},
+        ],
+    }
+    with pytest.raises(rules.RuleViolation) as exc:
+        rules.plan_day(settings, DAY, [], NOW, 3)
+
+    assert exc.value.code == "NO_ALLOWED_RANGE"
+    assert "没有重叠" in exc.value.message
+    assert "09:00-10:00" in exc.value.message
+    assert "11:00-17:00" in exc.value.message
+
+
+def test_free_ranges_requires_at_least_one_window() -> None:
+    """一个时段都没有时同样是 NO_ALLOWED_RANGE，文案指向"还没设置时段"。"""
+    settings = {**SETTINGS, "windows": []}
+    with pytest.raises(rules.RuleViolation) as exc:
+        rules.free_ranges(settings, DAY, [], NOW)
+
+    assert exc.value.code == "NO_ALLOWED_RANGE"
+    assert "还没有设置可活动时段" in exc.value.message
+
+
+def test_allowed_ranges_still_pure_when_nothing_matches() -> None:
+    """``allowed_ranges`` 保持纯函数：直接调用时空集就是空集，不抛异常。
+
+    抛异常的是 ``allowed_or_raise`` / ``free_ranges`` 那一层，
+    这样才能单测"交集怎么算"，而不用先处理异常。
+    """
+    settings = {**SETTINGS, "work_start": "09:00", "work_end": "10:00"}
+    assert rules.allowed_ranges(settings, DAY) == []

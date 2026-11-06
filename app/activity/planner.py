@@ -129,6 +129,26 @@ def _fmt_ranges(ranges: list[tuple]) -> str:
     return "、".join(f"{start:%H:%M}-{end:%H:%M}" for start, end in ranges)
 
 
+def _free_ranges(settings: dict, day, busy: list[dict], now) -> list[tuple]:
+    """可用区间；空的话当场失败，不白烧一次模型调用。
+
+    两件事在这里一次说清：
+
+    - 交集为空（工作时段和可活动时段没搭上）→ ``NO_ALLOWED_RANGE``，指向配置本身；
+    - 交集有、但剩下的都被占满或已经过去 → ``NO_SLOT_AVAILABLE``，指向今天的时间。
+
+    这两种都不该说成"模型给的时间不满足条件"：模型压根没被调用。
+    """
+    free = rules.free_ranges(settings, day, busy, now)
+    if not free:
+        raise rules.RuleViolation(
+            "NO_SLOT_AVAILABLE",
+            "今天这些时段剩下的时间已经被安排占满，或者已经过去了，没有能放活动的位置。"
+            "可以换一个更宽的时段，或者先处理掉今天的安排。",
+        )
+    return free
+
+
 def build_prompt(
     settings: dict,
     day,
@@ -136,14 +156,18 @@ def build_prompt(
     now,
     count: int,
     note: str = "",
+    *,
+    free: list[tuple] | None = None,
 ) -> str:
     """拼提示词。
 
     关键取舍：直接把 ``free_ranges`` 的结果（已经扣掉免打扰、已占用和已经过去的时间）
     作为"只能在这些区间里挑"喂给模型。让模型自己算窗口减免打扰减冲突，
     它算不对的概率很高，而算错的部分后端还要再丢掉一遍，纯浪费一次调用。
+
+    ``free`` 允许调用方传进来，避免 ``plan`` 和这里各算一遍。
     """
-    free = rules.free_ranges(settings, day, busy, now)
+    free = _free_ranges(settings, day, busy, now) if free is None else free
     catalog_lines = "\n".join(
         f"- {key}：{title} / {description}"
         for key, (title, description) in rules.ACTIVITY_CATALOG.items()
@@ -289,10 +313,15 @@ def plan(
     """让真实模型排一次，返回 ``(草稿, 解释, 被规则丢掉几条)``。
 
     抛 ``LlmUnavailable``：模型不可用或回复无法解析（调用方应如实报错，不要静默降级）。
-    抛 ``RuleViolation("LLM_NO_VALID_SLOT")``：解析出来了但没有一条通过校验。
+    抛 ``RuleViolation("NO_ALLOWED_RANGE")``：条件自相矛盾，模型不会被调用。
+    抛 ``RuleViolation("NO_SLOT_AVAILABLE")``：今天没有剩余位置，模型不会被调用。
+    抛 ``RuleViolation("LLM_NO_VALID_SLOT")``：模型确实给了建议，但没有一条通过校验。
     """
+    # 先算可用区间：算不出来就直接抛，别把"没位置"伪装成"模型给的时间不合格"。
+    # 顺序上放在构造 completer 之前 —— 条件本身有矛盾时，先把配置问题说清楚。
+    free = _free_ranges(settings, day, busy, now)
     call = completer or default_completer()
-    prompt = build_prompt(settings, day, busy, now, count, note)
+    prompt = build_prompt(settings, day, busy, now, count, note, free=free)
     explanation, items = _parse(call(prompt))
 
     drafts: list[rules.Draft] = []

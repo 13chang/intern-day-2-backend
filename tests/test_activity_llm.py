@@ -323,6 +323,93 @@ def test_half_quiet_pair_in_conditions_returns_422(
     assert "成对" in body["detail"]
 
 
+# ---------------------------------------------------------------- 条件自相矛盾
+
+# 截图上那组条件：工作时段 09:00-10:00，可活动时段 11:00-17:00 / 18:00-22:30。
+# allowed_ranges 取交集，交集是空集，任何引擎都排不出东西。
+CONTRADICTORY = {
+    "work_start": "09:00",
+    "work_end": "10:00",
+    "windows": [
+        {"label": "morning", "start": "11:00", "end": "17:00"},
+        {"label": "afternoon", "start": "18:00", "end": "22:30"},
+    ],
+}
+
+
+def test_llm_engine_blames_the_config_not_the_model(
+    client: TestClient, demo: dict, frozen
+) -> None:
+    """工作时段和可活动时段没搭上：422，并说清是哪两段。
+
+    这条是回归用例。以前这里会走完整条模型链路，最后抛
+    "真实模型给出的时间都不满足你设置的条件" —— 把配置自相矛盾说成模型不合格，
+    用户按提示去改免打扰、改次数，怎么改都不会好。
+    """
+    save_settings(client, demo["headers"], **CONTRADICTORY)
+
+    status, body = suggest(client, demo["headers"], engine="llm", count=3)
+
+    assert status == 422, body
+    assert "没有重叠" in body["detail"]
+    assert "09:00-10:00" in body["detail"]
+    assert "11:00-17:00" in body["detail"]
+
+
+def test_no_overlap_never_calls_the_model(
+    client: TestClient, demo: dict, frozen, monkeypatch
+) -> None:
+    """条件自相矛盾时压根不该发出模型请求。"""
+    save_settings(client, demo["headers"], **CONTRADICTORY)
+    prompts: list[str] = []
+
+    def spy() -> planner.Completer:
+        def call(prompt: str) -> str:
+            prompts.append(prompt)
+            return '{"suggestions": []}'
+
+        return call
+
+    monkeypatch.setattr(planner, "default_completer", spy)
+
+    status, _ = suggest(client, demo["headers"], engine="llm", count=3)
+
+    assert status == 422
+    assert prompts == []
+
+
+def test_rule_engine_gives_the_same_answer_for_no_overlap(
+    client: TestClient, demo: dict, frozen
+) -> None:
+    """两个引擎对同一组矛盾条件给出同一条提示 —— 判断只有一份实现。"""
+    save_settings(client, demo["headers"], **CONTRADICTORY)
+
+    status, body = suggest(client, demo["headers"], engine="rule")
+
+    assert status == 422, body
+    assert "没有重叠" in body["detail"]
+
+
+def test_no_overlap_can_be_fixed_by_overriding_conditions(
+    client: TestClient, demo: dict, frozen, llm
+) -> None:
+    """已保存的设置矛盾时，本次临时条件把它盖住就应该能正常出建议。"""
+    save_settings(client, demo["headers"], **CONTRADICTORY)
+    llm({"suggestions": [{"time": "11:30", "activity_type": "walk", "title": "走动"}]})
+
+    status, body = suggest(
+        client,
+        demo["headers"],
+        engine="llm",
+        count=1,
+        conditions={"work_start": "09:00", "work_end": "18:00"},
+    )
+
+    assert status == 200, body
+    assert body["mode"] == "llm"
+    assert body["suggestions"][0]["scheduled_at"][11:16] == "11:30"
+
+
 # ---------------------------------------------------------------- 保存时仍然校验
 
 def test_confirm_revalidates_llm_drafts(

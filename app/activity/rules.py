@@ -145,6 +145,38 @@ def allowed_ranges(settings: dict, day: date) -> list[Range]:
     return _merge(out)
 
 
+def describe_windows(settings: dict) -> str:
+    """把时段列表写成人话，用在错误提示里。"""
+    windows = settings.get("windows") or []
+    if not windows:
+        return "（没有设置可活动时段）"
+    return "、".join(f"{item['start']}-{item['end']}" for item in windows)
+
+
+def allowed_or_raise(settings: dict, day: date) -> list[Range]:
+    """``allowed_ranges`` 的非空版本：交集为空就直接说清是哪两段没搭上。
+
+    专门用来区分一类很误导的失败：工作时段 09:00-10:00 配可活动时段 11:00-17:00，
+    交集是空集，**任何引擎**都不可能排出东西。以前这种配置会一路走到
+    "可用时间不足"或者"模型给的时间都不满足条件"，提示语看着像模型抽风，
+    用户完全看不出是自己的两段配置压根没重叠。
+    """
+    ranges = allowed_ranges(settings, day)
+    if ranges:
+        return ranges
+    if not (settings.get("windows") or []):
+        raise RuleViolation(
+            "NO_ALLOWED_RANGE",
+            "还没有设置可活动时段，任何时间都不在允许范围内。先添加至少一个可活动时段。",
+        )
+    raise RuleViolation(
+        "NO_ALLOWED_RANGE",
+        f"工作时段 {settings['work_start']}-{settings['work_end']} 与可活动时段 "
+        f"{describe_windows(settings)} 没有重叠，任何时间都排不进去。"
+        f"把可活动时段挪进工作时段，或者放宽工作时段。",
+    )
+
+
 def quiet_ranges(settings: dict, day: date) -> list[Range]:
     """免打扰区间。
 
@@ -177,7 +209,8 @@ def free_ranges(
     ``ignore_id`` 是推迟场景必需的：算"后面还有没有位置"要把自己排除掉，
     否则永远和自己原来的时间冲突，表现为"今天永远没有可用时段"。
     """
-    ranges = allowed_ranges(settings, day)
+    # 用非空版本：交集为空是"条件自相矛盾"，不是"今天排满了"，提示语完全不同
+    ranges = allowed_or_raise(settings, day)
     for quiet in quiet_ranges(settings, day):
         ranges = _subtract(ranges, quiet)
 

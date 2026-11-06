@@ -24,6 +24,11 @@ router = APIRouter(prefix="/activity", tags=["activity"])
 HHMM = r"^([01]\d|2[0-3]):[0-5]\d$"
 ActivityType = str  # walk / water / stretch / stand，非法值由服务层的目录校验兜住
 
+# 参数不合法统一用 422。不写 status.HTTP_422_UNPROCESSABLE_ENTITY：
+# 新版本 Starlette 已经把它标成 deprecated（改用 HTTP_422_UNPROCESSABLE_CONTENT），
+# 而 ``dict.get`` 的默认值是每次调用都求值的，用它会让每条 422 都刷一行弃用警告。
+_UNPROCESSABLE = 422
+
 # 领域错误 → HTTP 状态。规则层只关心"哪里不合法"，状态码是接口层的决定。
 _STATUS_BY_CODE = {
     "NOT_FOUND": status.HTTP_404_NOT_FOUND,
@@ -32,12 +37,15 @@ _STATUS_BY_CODE = {
     # 用户选了真实模型引擎，但它排出来的时间全都不合条件：这是"当前排不出来"，
     # 不是请求写错了，所以用 409 而不是 422。
     "LLM_NO_VALID_SLOT": status.HTTP_409_CONFLICT,
+    # 工作时段和可活动时段没有交集：这组条件本身自相矛盾，任何引擎都排不出东西，
+    # 属于请求内容不合法，用 422（详情里会写清是哪两段没搭上）。
+    "NO_ALLOWED_RANGE": _UNPROCESSABLE,
 }
 
 
 def _http(exc: rules.RuleViolation) -> HTTPException:
     return HTTPException(
-        status_code=_STATUS_BY_CODE.get(exc.code, status.HTTP_422_UNPROCESSABLE_ENTITY),
+        status_code=_STATUS_BY_CODE.get(exc.code, _UNPROCESSABLE),
         detail=exc.message,
     )
 

@@ -1,0 +1,367 @@
+"""真实模型建议引擎（``engine="llm"``）的测试。
+
+这里不联网：``planner.default_completer`` 被换成一个返回预设文本的假函数。
+这样能覆盖真正容易出错的地方 —— JSON 容错、逐条校验、不合规丢弃、条件覆盖 ——
+而不是去测别人的 HTTP 客户端。
+
+另一个前提：conftest 把 ``MODEL_MODE`` 固定成 mock。所以"后端没配真实模型时
+请求 llm 引擎"这条路径可以直接测，不需要额外造环境。
+"""
+
+from __future__ import annotations
+
+import json
+from datetime import date, datetime, timedelta, timezone
+
+import pytest
+from fastapi.testclient import TestClient
+
+from app.activity import planner, rules
+
+TZ8 = timezone(timedelta(hours=8))
+NOW = datetime(2026, 11, 6, 9, 0, tzinfo=TZ8)
+DAY = date(2026, 11, 6)
+
+SETTINGS = {
+    "work_start": "09:00",
+    "work_end": "18:00",
+    "windows": [
+        {"label": "morning", "start": "10:00", "end": "12:00"},
+        {"label": "afternoon", "start": "14:00", "end": "17:30"},
+    ],
+    "quiet_start": "15:00",
+    "quiet_end": "16:00",
+    "daily_target": 3,
+}
+
+
+@pytest.fixture()
+def frozen(monkeypatch) -> datetime:
+    monkeypatch.setattr(rules, "now_local", lambda: NOW)
+    return NOW
+
+
+@pytest.fixture()
+def llm(monkeypatch):
+    """把真实模型换成"返回固定文本"的假模型，返回安装函数。"""
+
+    def install(text: str | dict) -> None:
+        raw = text if isinstance(text, str) else json.dumps(text, ensure_ascii=False)
+        monkeypatch.setattr(planner, "default_completer", lambda: (lambda _prompt: raw))
+
+    return install
+
+
+def save_settings(client: TestClient, headers: dict, **overrides) -> dict:
+    response = client.put("/activity/settings", headers=headers, json={**SETTINGS, **overrides})
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def suggest(client: TestClient, headers: dict, **body) -> tuple[int, dict]:
+    response = client.post("/activity/suggestions", headers=headers, json=body)
+    return response.status_code, response.json()
+
+
+# ---------------------------------------------------------------- 引擎可用性
+
+def test_engines_report_rule_always_llm_only_when_configured(
+    client: TestClient, demo: dict
+) -> None:
+    """Mock 模式下 llm 必须标成不可用，并给出原因 —— 前端据此禁用按钮。"""
+    response = client.get("/activity/engines", headers=demo["headers"])
+    assert response.status_code == 200, response.text
+    engines = {item["id"]: item for item in response.json()["engines"]}
+
+    assert engines["rule"]["available"] is True
+    assert engines["llm"]["available"] is False
+    assert "mock" in engines["llm"]["reason"].lower()
+
+
+def test_engines_requires_login(client: TestClient) -> None:
+    assert client.get("/activity/engines").status_code == 401
+
+
+def test_llm_engine_refuses_when_backend_is_mock(
+    client: TestClient, demo: dict, frozen
+) -> None:
+    """没配真实模型却请求 llm：如实报错，不能悄悄退回规则引擎。"""
+    status, body = suggest(client, demo["headers"], engine="llm")
+    assert status == 409
+    assert "Mock" in body["detail"]
+
+
+# ---------------------------------------------------------------- 正常产出
+
+def test_llm_engine_returns_validated_drafts(
+    client: TestClient, demo: dict, frozen, llm
+) -> None:
+    save_settings(client, demo["headers"])
+    llm(
+        {
+            "explanation": "上午和下午各一次，避开你开会的时段。",
+            "suggestions": [
+                {"time": "10:30", "activity_type": "walk", "title": "走廊走两圈",
+                 "description": "顺路接杯水", "reason": "刚上班不久，先动一下"},
+                {"time": "16:30", "activity_type": "stretch", "title": "肩颈放松",
+                 "description": "慢慢转两下", "reason": "下午容易僵"},
+            ],
+        }
+    )
+
+    status, body = suggest(client, demo["headers"], engine="llm", count=2)
+
+    assert status == 200, body
+    assert body["mode"] == "llm"
+    assert body["dropped"] == 0
+    assert body["explanation"] == "上午和下午各一次，避开你开会的时段。"
+    assert [item["scheduled_at"][11:16] for item in body["suggestions"]] == ["10:30", "16:30"]
+    assert body["suggestions"][0]["title"] == "走廊走两圈"
+
+
+def test_llm_drafts_are_not_persisted(client: TestClient, demo: dict, frozen, llm) -> None:
+    """建议只算不存：调完接口，当天列表必须还是空的。"""
+    save_settings(client, demo["headers"])
+    llm({"suggestions": [{"time": "10:30", "activity_type": "walk"}]})
+
+    suggest(client, demo["headers"], engine="llm", count=1)
+
+    listing = client.get("/activity/today", headers=demo["headers"]).json()
+    assert listing == []
+
+
+def test_llm_drops_suggestions_that_break_rules(
+    client: TestClient, demo: dict, frozen, llm
+) -> None:
+    """模型给的时间落在免打扰/窗口外/已过去，一律丢弃，并把条数如实告诉用户。"""
+    save_settings(client, demo["headers"])
+    llm(
+        {
+            "suggestions": [
+                {"time": "10:30", "activity_type": "walk", "title": "正常一条"},
+                {"time": "15:30", "activity_type": "walk", "title": "在免打扰里"},
+                {"time": "08:00", "activity_type": "walk", "title": "在窗口外"},
+                {"time": "08:30", "activity_type": "walk", "title": "已经过去了"},
+            ]
+        }
+    )
+
+    status, body = suggest(client, demo["headers"], engine="llm", count=4)
+
+    assert status == 200, body
+    assert [item["scheduled_at"][11:16] for item in body["suggestions"]] == ["10:30"]
+    assert body["dropped"] == 3
+    assert "3 条" in body["notice"]
+
+
+def test_llm_falls_back_to_catalog_text(client: TestClient, demo: dict, frozen, llm) -> None:
+    """模型给了不存在的活动类型、又没写标题：用活动库兜住，不留空白。"""
+    save_settings(client, demo["headers"])
+    llm({"suggestions": [{"time": "10:30", "activity_type": "teleport", "title": ""}]})
+
+    status, body = suggest(client, demo["headers"], engine="llm", count=1)
+
+    assert status == 200, body
+    draft = body["suggestions"][0]
+    assert draft["activity_type"] == "walk"
+    assert draft["title"] == rules.ACTIVITY_CATALOG["walk"][0]
+
+
+def test_llm_dedupes_same_time(client: TestClient, demo: dict, frozen, llm) -> None:
+    """同一个时间给两条，只留一条 —— 否则用户会勾到两条一模一样的安排。"""
+    save_settings(client, demo["headers"])
+    llm(
+        {
+            "suggestions": [
+                {"time": "10:30", "activity_type": "walk", "title": "第一条"},
+                {"time": "10:30", "activity_type": "water", "title": "重复时间"},
+            ]
+        }
+    )
+
+    status, body = suggest(client, demo["headers"], engine="llm", count=2)
+
+    assert status == 200, body
+    assert len(body["suggestions"]) == 1
+    assert body["dropped"] == 1
+
+
+# ---------------------------------------------------------------- 回复容错
+
+def test_llm_accepts_markdown_fenced_json(client: TestClient, demo: dict, frozen, llm) -> None:
+    """模型常把 JSON 包在 ```json 里，要能拆掉。"""
+    save_settings(client, demo["headers"])
+    llm(
+        """好的，建议如下：
+```json
+{"suggestions": [{"time": "10:30", "activity_type": "water", "title": "接水"}]}
+```"""
+    )
+
+    status, body = suggest(client, demo["headers"], engine="llm", count=1)
+
+    assert status == 200, body
+    assert body["suggestions"][0]["title"] == "接水"
+
+
+def test_llm_rejects_non_json_reply(client: TestClient, demo: dict, frozen, llm) -> None:
+    save_settings(client, demo["headers"])
+    llm("抱歉，我无法完成这个请求。")
+
+    status, body = suggest(client, demo["headers"], engine="llm")
+
+    assert status == 409
+    assert "JSON" in body["detail"]
+
+
+def test_llm_without_any_valid_slot_returns_409(
+    client: TestClient, demo: dict, frozen, llm
+) -> None:
+    save_settings(client, demo["headers"])
+    llm({"suggestions": [{"time": "15:30", "activity_type": "walk"}]})
+
+    status, body = suggest(client, demo["headers"], engine="llm")
+
+    assert status == 409
+    assert "不满足" in body["detail"]
+
+
+def test_llm_empty_suggestions_returns_409(client: TestClient, demo: dict, frozen, llm) -> None:
+    save_settings(client, demo["headers"])
+    llm({"explanation": "今天没空位", "suggestions": []})
+
+    status, body = suggest(client, demo["headers"], engine="llm")
+    assert status == 409
+
+
+# ---------------------------------------------------------------- 条件覆盖
+
+def test_conditions_apply_to_rule_engine(client: TestClient, demo: dict, frozen) -> None:
+    """临时把下午窗口改成 16:00-17:00、关掉免打扰：排出的时间必须只落在这里。"""
+    save_settings(client, demo["headers"])
+
+    status, body = suggest(
+        client,
+        demo["headers"],
+        engine="rule",
+        count=2,
+        conditions={
+            "windows": [{"label": "afternoon", "start": "16:00", "end": "17:00"}],
+            "ignore_quiet": True,
+        },
+    )
+
+    assert status == 200, body
+    times = [item["scheduled_at"][11:16] for item in body["suggestions"]]
+    assert times, "这个条件下应该能排出东西"
+    assert all("16:00" <= value < "17:00" for value in times), times
+
+
+def test_conditions_do_not_change_saved_settings(
+    client: TestClient, demo: dict, frozen
+) -> None:
+    """临时条件只影响这一次生成，不能顺手改掉长期设置。"""
+    save_settings(client, demo["headers"])
+
+    suggest(
+        client,
+        demo["headers"],
+        engine="rule",
+        conditions={
+            "work_start": "08:00",
+            "work_end": "20:00",
+            "windows": [{"label": "all", "start": "08:00", "end": "20:00"}],
+            "ignore_quiet": True,
+        },
+    )
+
+    saved = client.get("/activity/settings", headers=demo["headers"]).json()
+    assert saved["work_start"] == "09:00"
+    assert saved["quiet_start"] == "15:00"
+    assert [window["start"] for window in saved["windows"]] == ["10:00", "14:00"]
+
+
+def test_ignore_quiet_lets_llm_use_former_quiet_hours(
+    client: TestClient, demo: dict, frozen, llm
+) -> None:
+    """显式关掉免打扰后，15:30 这种原本会被拒的时间应当被接受。"""
+    save_settings(client, demo["headers"])
+    llm({"suggestions": [{"time": "15:30", "activity_type": "stand", "title": "站起来"}]})
+
+    status, body = suggest(
+        client, demo["headers"], engine="llm", count=1, conditions={"ignore_quiet": True}
+    )
+
+    assert status == 200, body
+    assert body["suggestions"][0]["scheduled_at"][11:16] == "15:30"
+
+
+def test_inverted_condition_window_returns_422(client: TestClient, demo: dict, frozen) -> None:
+    save_settings(client, demo["headers"])
+
+    status, body = suggest(
+        client,
+        demo["headers"],
+        engine="rule",
+        conditions={"windows": [{"label": "x", "start": "17:00", "end": "16:00"}]},
+    )
+
+    assert status == 422
+    assert "开始时间必须早于" in body["detail"]
+
+
+def test_half_quiet_pair_in_conditions_returns_422(
+    client: TestClient, demo: dict, frozen
+) -> None:
+    save_settings(client, demo["headers"])
+
+    status, body = suggest(
+        client, demo["headers"], engine="rule", conditions={"quiet_start": "15:00"}
+    )
+
+    assert status == 422
+    assert "成对" in body["detail"]
+
+
+# ---------------------------------------------------------------- 保存时仍然校验
+
+def test_confirm_revalidates_llm_drafts(
+    client: TestClient, demo: dict, frozen, llm
+) -> None:
+    """模型给的建议，保存时仍然要过一遍当时的设置。
+
+    先按"没有免打扰"拿到 15:30，再把免打扰恢复成 15:00-16:00 去保存：
+    必须被拒，否则"确认保存"这道闸对模型就是虚设的。
+    """
+    save_settings(client, demo["headers"], quiet_start=None, quiet_end=None)
+    llm({"suggestions": [{"time": "15:30", "activity_type": "walk", "title": "走动"}]})
+
+    status, body = suggest(client, demo["headers"], engine="llm", count=1)
+    assert status == 200, body
+    drafts = body["suggestions"]
+
+    save_settings(client, demo["headers"])  # 恢复免打扰 15:00-16:00
+    response = client.post("/activity/confirm", headers=demo["headers"], json={"items": drafts})
+
+    assert response.status_code == 422
+    assert response.json()["detail"].startswith("第 1 条")
+
+
+# ---------------------------------------------------------------- 提示词
+
+def test_prompt_only_offers_free_ranges(frozen) -> None:
+    """提示词里给的是"已扣掉免打扰和已有安排"的区间，不是原始窗口。"""
+    settings = {**SETTINGS}
+    busy = [
+        {"id": 1, "title": "已排的活动", "scheduled_at": "2026-11-06T14:25:00+08:00",
+         "duration_min": 5, "status": "planned"}
+    ]
+
+    prompt = planner.build_prompt(settings, DAY, busy, NOW, 3, "下午容易困")
+
+    assert "10:00-12:00" in prompt
+    assert "16:00-17:30" in prompt
+    # 免打扰那一段不能作为可选区间出现，14:00-15:00 会因为 14:25 的已排活动被切开
+    assert "15:00-16:00" not in prompt
+    assert "下午容易困" in prompt
+    assert "walk" in prompt and "stretch" in prompt

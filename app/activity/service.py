@@ -77,11 +77,12 @@ def get_settings(user_id: int) -> dict:
     return _settings_from_row(row)
 
 
-def save_settings(user_id: int, payload: dict) -> dict:
-    """整份覆盖写入。
+def validate_settings(payload: dict) -> None:
+    """跨字段校验。
 
-    跨字段规则（结束必须晚于开始、免打扰成对、窗口 start<end）放在这里：
-    pydantic 只能校验单个字段的格式，表达不了"两个字段之间的关系"。
+    pydantic 只能校验单个字段的格式，表达不了"两个字段之间的关系"（例如结束必须晚于开始），
+    所以放在这里。存库（``save_settings``）和"仅本次生成用"的临时条件
+    （``resolve_conditions``）共用这一份，避免出现"设置里能存、生成时却说条件不合法"。
     """
     work_start, work_end = payload["work_start"], payload["work_end"]
     if work_start >= work_end:
@@ -101,6 +102,15 @@ def save_settings(user_id: int, payload: dict) -> dict:
     target = int(payload.get("daily_target", 3))
     if not 1 <= target <= 8:
         raise rules.RuleViolation("INVALID_DAILY_TARGET", "每天次数需要在 1 到 8 之间。")
+
+
+def save_settings(user_id: int, payload: dict) -> dict:
+    """整份覆盖写入。"""
+    validate_settings(payload)
+
+    work_start, work_end = payload["work_start"], payload["work_end"]
+    quiet_start, quiet_end = payload.get("quiet_start"), payload.get("quiet_end")
+    target = int(payload.get("daily_target", 3))
 
     stamp = int(time.time())
     windows_json = json.dumps(payload.get("windows") or [], ensure_ascii=False)
@@ -140,6 +150,46 @@ def save_settings(user_id: int, payload: dict) -> dict:
     return get_settings(user_id)
 
 
+def resolve_conditions(user_id: int, overrides: dict | None = None) -> dict:
+    """已保存的设置 + 本次生成用的临时条件。
+
+    为什么要有这一层：DeepSeek 模式下用户会在建议面板里现场改工作时段、上午/下午窗口、
+    免打扰，这些只对"这一次生成"生效，不写回设置（否则改一次条件就悄悄改了长期偏好）。
+    合并完仍然走 ``validate_settings``，所以临时条件也不许绕过规则。
+    """
+    settings = get_settings(user_id)
+    if not overrides:
+        return settings
+
+    merged = dict(settings)
+    for key in ("work_start", "work_end"):
+        value = overrides.get(key)
+        if value:
+            merged[key] = value
+
+    windows = overrides.get("windows")
+    if windows:
+        # 传了就是整份替换：上午/下午的窗口由前端一起给，不做"部分合并"，
+        # 否则删掉一个窗口在前端看起来成功、后端其实还留着原来的。
+        merged["windows"] = [dict(item) for item in windows]
+
+    if overrides.get("ignore_quiet"):
+        # "暂时关闭提醒" = 这次不考虑免打扰。只是本次计算时不算它，设置里仍然保留。
+        merged["quiet_start"] = None
+        merged["quiet_end"] = None
+    else:
+        quiet_start = overrides.get("quiet_start")
+        quiet_end = overrides.get("quiet_end")
+        if quiet_start and quiet_end:
+            merged["quiet_start"] = quiet_start
+            merged["quiet_end"] = quiet_end
+        elif quiet_start or quiet_end:
+            raise rules.RuleViolation("INVALID_QUIET", "免打扰的开始和结束时间需要成对填写。")
+
+    validate_settings(merged)
+    return merged
+
+
 # ---------------------------------------------------------------- 查询
 
 def _load_day(conn, user_id: int, day: date) -> list[dict]:
@@ -158,6 +208,15 @@ def _load_day(conn, user_id: int, day: date) -> list[dict]:
 def list_day(user_id: int, day: date) -> list[dict]:
     with get_conn() as conn:
         return _load_day(conn, user_id, day)
+
+
+def planned_of_day(user_id: int, day: date) -> list[dict]:
+    """当天已占用（只算待执行的）。
+
+    已完成/已跳过/已推迟的条目不占时间：用户已经处理过了，把它们也算成"冲突"
+    会让下午再也排不进东西。
+    """
+    return [row for row in list_day(user_id, day) if row["status"] == "planned"]
 
 
 def _owned(conn, user_id: int, activity_id: int) -> dict:
@@ -285,11 +344,19 @@ def generate_day(user_id: int, day: date, force: bool = False) -> dict:
     return {"created": len(drafts), "activities": activities, "notice": notice}
 
 
-def suggest_day(user_id: int, count: int | None = None) -> tuple[list[rules.Draft], int, dict]:
-    """只算不存。Agent 与"生成建议"按钮共用这一条路径。"""
-    settings = get_settings(user_id)
+def suggest_day(
+    user_id: int,
+    count: int | None = None,
+    conditions: dict | None = None,
+) -> tuple[list[rules.Draft], int, dict]:
+    """只算不存（规则引擎）。Agent 与"生成建议"按钮共用这一条路径。
+
+    ``conditions`` 是本次生成的临时条件（见 ``resolve_conditions``）；
+    不传就和以前一样，完全按已保存的设置算。
+    """
+    settings = resolve_conditions(user_id, conditions)
     day = rules.now_local().date()
-    busy = [row for row in list_day(user_id, day) if row["status"] == "planned"]
+    busy = planned_of_day(user_id, day)
     drafts, feasible = rules.plan_day(
         settings, day, busy, rules.now_local(), count or settings["daily_target"]
     )

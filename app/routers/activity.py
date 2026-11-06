@@ -12,7 +12,8 @@ from datetime import date, timedelta
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
-from app.activity import rules, service
+from app.activity import planner, rules, service
+from app.agent.config import load_llm_settings
 from app.deps import get_current_user
 
 router = APIRouter(prefix="/activity", tags=["activity"])
@@ -25,6 +26,9 @@ _STATUS_BY_CODE = {
     "NOT_FOUND": status.HTTP_404_NOT_FOUND,
     "INVALID_STATE": status.HTTP_409_CONFLICT,
     "NO_SLOT_AVAILABLE": status.HTTP_409_CONFLICT,
+    # 用户选了真实模型引擎，但它排出来的时间全都不合条件：这是"当前排不出来"，
+    # 不是请求写错了，所以用 409 而不是 422。
+    "LLM_NO_VALID_SLOT": status.HTTP_409_CONFLICT,
 }
 
 
@@ -95,9 +99,26 @@ class DraftOut(BaseModel):
     reason: str = ""
 
 
+class ConditionsIn(BaseModel):
+    """本次生成用的条件，**不落库**。
+
+    省略某个字段表示"沿用已保存的设置"；传了就只影响这一次生成。
+    这样用户可以在建议面板里临时试试"如果下午不安排会怎样"，而不必改长期设置。
+    """
+
+    work_start: str | None = Field(default=None, pattern=HHMM)
+    work_end: str | None = Field(default=None, pattern=HHMM)
+    windows: list[WindowIn] | None = Field(default=None, description="传了就整份替换")
+    quiet_start: str | None = Field(default=None, pattern=HHMM)
+    quiet_end: str | None = Field(default=None, pattern=HHMM)
+    ignore_quiet: bool = Field(default=False, description="这次不考虑免打扰（暂时关闭提醒）")
+
+
 class SuggestRequest(BaseModel):
+    engine: str = Field(default="rule", pattern="^(rule|llm)$", description="rule=本地规则，llm=真实模型")
     count: int | None = Field(default=None, ge=1, le=8)
     note: str | None = Field(default=None, max_length=200, description="自然语言偏好")
+    conditions: ConditionsIn | None = None
 
 
 class SuggestOut(BaseModel):
@@ -105,6 +126,21 @@ class SuggestOut(BaseModel):
     explanation: str
     notice: str = ""
     mode: str = "rule"
+    dropped: int = Field(default=0, description="模型给出但被规则丢掉的条数")
+
+
+class EngineOut(BaseModel):
+    """一个可选的建议引擎，以及它现在能不能用。"""
+
+    id: str
+    label: str
+    available: bool
+    model: str | None = None
+    reason: str
+
+
+class EnginesOut(BaseModel):
+    engines: list[EngineOut]
 
 
 class ConfirmRequest(BaseModel):
@@ -202,49 +238,101 @@ def weekly(
     return service.weekly_stats(user["id"], start)
 
 
+# ---------------------------------------------------------------- 建议引擎
+
+@router.get("/engines", response_model=EnginesOut, summary="可用的建议生成引擎")
+def engines(user: dict = Depends(get_current_user)) -> dict:
+    """告诉前端"能不能选 DeepSeek"。
+
+    单独开一个接口而不是让前端读环境变量：前端拿不到后端的环境变量，
+    而猜一个（"大概配了吧"）一旦猜错，用户点了按钮才看到报错，体验很差。
+    """
+    llm = load_llm_settings()
+    return {
+        "engines": [
+            {
+                "id": "rule",
+                "label": "本地规则",
+                "available": True,
+                "model": None,
+                "reason": "服务端规则算法，不联网、响应快、结论确定",
+            },
+            {
+                "id": "llm",
+                "label": "DeepSeek 真实模型",
+                "available": not llm.is_mock,
+                "model": llm.model,
+                "reason": llm.reason,
+            },
+        ]
+    }
+
+
 # ---------------------------------------------------------------- Agent 建议
+
+def _draft_out(draft: rules.Draft) -> dict:
+    return {
+        "scheduled_at": rules.iso(draft.at),
+        "activity_type": draft.activity_type,
+        "title": draft.title,
+        "description": draft.description,
+        "duration_min": draft.duration_min,
+        "reason": draft.reason,
+    }
+
 
 @router.post("/suggestions", response_model=SuggestOut, summary="生成安排建议（不保存）")
 def suggestions(
     payload: SuggestRequest | None = None,
     user: dict = Depends(get_current_user),
 ) -> dict:
-    """只产出草稿，不写库。
+    """只产出草稿，不写库。两个引擎共用这个入口。
 
     保存必须由用户在页面上点"确认"走 ``/activity/confirm``，
-    这样"Agent 建议"和"用户手填时间"会经过同一条校验。
+    这样"模型建议"和"用户手填时间"会经过同一条校验。
     """
-    count = payload.count if payload else None
-    note = payload.note if payload else None
+    request = payload or SuggestRequest()
+    conditions = request.conditions.model_dump() if request.conditions else None
+    note = (request.note or "").strip()
+    dropped = 0
+
     try:
-        drafts, feasible, settings = service.suggest_day(user["id"], count)
+        if request.engine == "llm":
+            # 先按条件算出"今天还剩哪些可活动时段"，把这张时间表交给模型，
+            # 让它只负责挑时间与活动，而不是自己算窗口减免打扰减冲突。
+            settings = service.resolve_conditions(user["id"], conditions)
+            now = rules.now_local()
+            day = now.date()
+            busy = service.planned_of_day(user["id"], day)
+            count = request.count or settings["daily_target"]
+            drafts, explanation, dropped = planner.plan(
+                settings, day, busy, now, count, note
+            )
+            feasible = len(drafts)
+        else:
+            drafts, feasible, settings = service.suggest_day(
+                user["id"], request.count, conditions
+            )
+            prefix = f"考虑到你说的「{note}」，" if note else ""
+            explanation = f"{prefix}按你的可活动时段排了 {feasible} 次，已经避开免打扰时间。"
+    except planner.LlmUnavailable as exc:
+        # 用户明确选了真实模型，就如实报错，不要偷偷换成规则引擎
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     except rules.RuleViolation as exc:
         raise _http(exc) from exc
 
-    suggestions_out = [
-        {
-            "scheduled_at": rules.iso(draft.at),
-            "activity_type": draft.activity_type,
-            "title": draft.title,
-            "description": draft.description,
-            "duration_min": draft.duration_min,
-            "reason": draft.reason,
-        }
-        for draft in drafts
-    ]
-
-    prefix = f"考虑到你说的「{note}」，" if note else ""
-    explanation = (
-        f"{prefix}按你的可活动时段排了 {feasible} 次，已经避开免打扰时间。"
-    )
     notice = ""
-    if feasible < (count or settings["daily_target"]):
+    if feasible < (request.count or settings["daily_target"]):
         notice = f"可用时间只够安排 {feasible} 次。"
+    if dropped:
+        notice = f"{f'模型有 {dropped} 条建议不满足条件，已丢弃。'}{notice}"
+
     return {
-        "suggestions": suggestions_out,
+        "suggestions": [_draft_out(draft) for draft in drafts],
         "explanation": explanation,
         "notice": notice,
-        "mode": "rule",
+        "mode": request.engine,
+        "dropped": dropped,
     }
 
 

@@ -349,19 +349,28 @@ def plan(
     drafts: list[rules.Draft] = []
     dropped = 0
     seen: set[str] = set()
-    for item in items:
+    # 同一批建议之间也要够间隔。``validate_slot`` 只跟"已有安排"比，
+    # 两条草稿彼此隔 10 分钟它是不管的 —— 结果是：建议里看着正常，用户全勾上点确认，
+    # 第 2 条被 422（confirm 逐条插库，后一条会把前一条算进 busy）。
+    # 把本轮已经收下的草稿也并进 busy，两个入口的判断就一致了。
+    accepted: list[dict] = []
+    # 按时间顺序处理：撞车时留早的那条，和用户的直觉一致
+    for item in sorted(items, key=lambda entry: entry.time):
         if item.time in seen:
             # 同一个时间给两条，等于让用户勾两条一模一样的
             dropped += 1
             continue
         try:
             draft = _to_draft(item, day)
-            rules.validate_slot(settings, draft.at, day, busy, now)
+            rules.validate_slot(settings, draft.at, day, busy + accepted, now)
         except (ValueError, rules.RuleViolation):
             dropped += 1
             continue
         seen.add(item.time)
         drafts.append(draft)
+        accepted.append(
+            {"scheduled_at": rules.iso(draft.at), "duration_min": draft.duration_min}
+        )
 
     if not drafts:
         raise rules.RuleViolation(

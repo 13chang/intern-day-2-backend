@@ -224,6 +224,51 @@ def test_prompt_omits_preference_section_when_note_is_empty(frozen) -> None:
     assert "没特别说明" not in prompt
 
 
+def test_llm_drops_suggestions_too_close_to_each_other(
+    client: TestClient, demo: dict, frozen, llm
+) -> None:
+    """同一批建议之间也要够间隔：10 分钟内两条，只留早的那条。
+
+    回归用例。``validate_slot`` 只跟"已有安排"比，两条草稿彼此隔 10 分钟它是不管的，
+    于是"建议里 4 条都能勾、确认第 2 条 422"—— 生成和保存两套结论。
+    """
+    save_settings(client, demo["headers"])
+    llm(
+        {
+            "suggestions": [
+                {"time": "10:30", "activity_type": "walk", "title": "早的那条"},
+                {"time": "10:40", "activity_type": "water", "title": "隔得太近"},
+            ]
+        }
+    )
+
+    status, body = suggest(client, demo["headers"], engine="llm", count=2)
+
+    assert status == 200, body
+    assert [item["scheduled_at"][11:16] for item in body["suggestions"]] == ["10:30"]
+    assert body["dropped"] == 1
+
+
+def test_llm_keeps_earlier_slot_when_model_returns_out_of_order(
+    client: TestClient, demo: dict, frozen, llm
+) -> None:
+    """模型把晚的写在前面，留下的仍然是早的那条。"""
+    save_settings(client, demo["headers"])
+    llm(
+        {
+            "suggestions": [
+                {"time": "10:40", "activity_type": "water", "title": "晚的写在前面"},
+                {"time": "10:30", "activity_type": "walk", "title": "早的写在后面"},
+            ]
+        }
+    )
+
+    status, body = suggest(client, demo["headers"], engine="llm", count=2)
+
+    assert status == 200, body
+    assert [item["scheduled_at"][11:16] for item in body["suggestions"]] == ["10:30"]
+
+
 def test_llm_dedupes_same_time(client: TestClient, demo: dict, frozen, llm) -> None:
     """同一个时间给两条，只留一条 —— 否则用户会勾到两条一模一样的安排。"""
     save_settings(client, demo["headers"])

@@ -559,7 +559,7 @@ invoke_agent todo-assistant  1723ms
 
 ```bash
 uv run pytest -q
-# 236 passed
+# 238 passed
 ```
 
 新增四个文件：
@@ -570,7 +570,7 @@ uv run pytest -q
 - `tests/test_activity_api.py`（19 个用例）：设置默认值与校验、生成幂等、三个操作的状态流转与幂等、
   推迟无时段时原条仍 `planned`、周统计四个数字、建议不落库、确认时免打扰被拒并带序号、
   跨用户 404 与数据隔离；
-- `tests/test_activity_llm.py`（26 个用例）：引擎可用性、模型产出经校验后才算数、
+- `tests/test_activity_llm.py`（28 个用例）：引擎可用性、模型产出经校验后才算数、
   不合规建议被丢弃并计数、非法活动类型连带文案一起回落、同一时间去重、
   Markdown 代码块里的 JSON、回复不是 JSON、一条都不合规则、条件覆盖（窗口/免打扰开关/次数）、
   条件自相矛盾时 422 且**根本不调模型**、偏好超出四类时提示词要求如实说明、
@@ -645,7 +645,9 @@ RUNTIME_PROXY_TARGET=http://localhost:4001 npm run dev
 错的时候后端还得再丢一遍，纯浪费一次调用。
 
 模型回来的每一条都要过 `rules.validate_slot`：落在免打扰里、撞上已有安排、时间已经过去，
-一律丢弃并把条数如实告诉用户（`dropped` / notice）。`activity_type` 不在活动库里、
+一律丢弃并把条数如实告诉用户（`dropped` / notice）。校验时把**本轮已经收下的草稿**
+也并进 `busy`：`validate_slot` 只跟"已有安排"比，两条草稿彼此隔 10 分钟它是不管的，
+少了这一步就会出现"建议里 4 条都能勾、确认时第 2 条 422"。`activity_type` 不在活动库里、
 或者标题为空时，回落到活动库的文案 —— 类型不认识时**连模型写的标题和说明一起丢掉**，
 否则会出现"类型是走动、标题是去打球、时长 5 分钟"的假满足（`test_unknown_type_also_drops_model_wording`）。
 

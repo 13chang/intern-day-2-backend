@@ -37,7 +37,7 @@ from agent_framework import (
 )
 from agent_framework._tools import FunctionInvocationLayer
 
-from app.agent.tools import TOOL_NAME
+from app.agent.tools import TOOL_NAME, TOOL_NAME_SUGGEST_SLOTS
 
 MOCK_BANNER = "（Mock 模式：未连接真实模型，以下内容由本地规则生成）"
 
@@ -124,10 +124,39 @@ class Intent(str, Enum):
     """一次用户输入想要什么。分类结果直接决定要不要调工具。"""
 
     QUERY = "query"
+    SCHEDULE = "schedule"
     WRITE = "write"
     OUT_OF_SCOPE = "out_of_scope"
     AMBIGUOUS = "ambiguous"
     SMALL_TALK = "small_talk"
+
+
+# 第五天：问"怎么安排""什么时候动一下"时，要调的是算时段的工具，不是查待办。
+# 判定顺序上放在 QUERY 之前：「把下午的安排重排一下」这类话同时含"安排"和待办语境，
+# 归到建议比归到查询更接近用户意图。
+SCHEDULE_WORDS = (
+    "安排",
+    "建议",
+    "排一下",
+    "怎么动",
+    "动一下",
+    "活动",
+    "久坐",
+    "休息一下",
+)
+
+_COUNT_WORDS = {"一": 1, "两": 2, "二": 2, "三": 3, "四": 4, "五": 5}
+
+
+def _guess_count(text: str) -> int:
+    """从「今天只想安排两次」「排三条」里取次数，取不到就默认 3。"""
+    match = re.search(r"([0-9]+|[一两二三四五])\s*次", text or "")
+    if not match:
+        return 3
+    raw = match.group(1)
+    if raw.isdigit():
+        return max(1, min(int(raw), 8))
+    return _COUNT_WORDS.get(raw, 3)
 
 
 def classify(text: str) -> Intent:
@@ -141,6 +170,8 @@ def classify(text: str) -> Intent:
         return Intent.WRITE
     if any(word in lowered for word in OUT_OF_SCOPE_WORDS):
         return Intent.OUT_OF_SCOPE
+    if any(word in lowered for word in SCHEDULE_WORDS):
+        return Intent.SCHEDULE
     if any(word in lowered for word in TODO_WORDS):
         return Intent.QUERY
     if any(word in lowered for word in AMBIGUOUS_WORDS):
@@ -276,10 +307,13 @@ class MockChatClient(FunctionInvocationLayer, BaseChatClient):
         question = self._last_user_text(messages)
         intent = classify(question)
 
+        if intent is Intent.SCHEDULE:
+            # 建议类请求：只算不存。次数从话里取，没提就用默认 3。
+            return "tool", (TOOL_NAME_SUGGEST_SLOTS, {"count": _guess_count(question)})
         if intent is Intent.QUERY:
             # 参数显式给出，不依赖默认值：评测里"省略参数"和"明确要求全部"
             # 在事件上长得一模一样，显式传值才能被验证。
-            return "tool", {"only_pending": wants_pending_only(question)}
+            return "tool", (TOOL_NAME, {"only_pending": wants_pending_only(question)})
         if intent is Intent.WRITE:
             return "text", f"{MOCK_BANNER}\n{WRITE_REPLY}"
         if intent is Intent.OUT_OF_SCOPE:
@@ -299,10 +333,12 @@ class MockChatClient(FunctionInvocationLayer, BaseChatClient):
         基线时只是把工具结果原样贴出来，读起来像"接口返回"，不像回答。
         """
         total = len(re.findall(r"^\d+\.\s", tool_result, flags=re.MULTILINE))
-        if not total:
-            return f"{MOCK_BANNER}\n{tool_result}"
         pending = tool_result.count("[未完成]")
         done = tool_result.count("[已完成]")
+        # 不是待办结果（例如活动建议）就不要套用"未完成 / 已完成"的统计，
+        # 否则会变成"以上共 3 条：未完成 0 条，已完成 0 条"这种明显错误的回答。
+        if not total or (pending == 0 and done == 0):
+            return f"{MOCK_BANNER}\n{tool_result}"
         return (
             f"{MOCK_BANNER}\n{tool_result}\n\n"
             f"以上共 {total} 条：未完成 {pending} 条，已完成 {done} 条。"
@@ -323,11 +359,11 @@ class MockChatClient(FunctionInvocationLayer, BaseChatClient):
         action, payload = self._plan(messages)
 
         if action == "tool":
-            arguments: dict[str, Any] = dict(payload)
+            tool_name, arguments = payload
             call = Content.from_function_call(
                 call_id=f"mock-{uuid.uuid4().hex[:12]}",
-                name=TOOL_NAME,
-                arguments=arguments,
+                name=tool_name,
+                arguments=dict(arguments),
             )
             if not stream:
                 return ChatResponse(

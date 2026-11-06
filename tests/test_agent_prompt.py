@@ -31,6 +31,9 @@ from app.agent.mock import Intent, classify, wants_pending_only
         ("我有哪些待办？", Intent.QUERY),
         ("帮我看看我还有哪些活没干完", Intent.QUERY),
         ("只看未完成的待办", Intent.QUERY),
+        # 第五天：活动安排建议走算时段的工具，不是查待办
+        ("下午比较忙，帮我安排两次", Intent.SCHEDULE),
+        ("我什么时候可以起来动一下", Intent.SCHEDULE),
         # 信息不足
         ("帮我处理一下那个", Intent.AMBIGUOUS),
         ("帮我弄一下这个", Intent.AMBIGUOUS),

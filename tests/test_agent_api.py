@@ -79,8 +79,13 @@ def test_agent_info_reports_mock_mode(client: TestClient, demo: dict) -> None:
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["mode"] == "mock"
-    assert body["agent"] == "todo-assistant"
-    assert body["tools"] == ["list_my_todos"]
+    assert body["agent"] == "activity-assistant"
+    assert body["tools"] == [
+        "list_my_todos",
+        "get_my_activity_settings",
+        "get_my_today_activities",
+        "compute_suggested_slots",
+    ]
     # 说明里不能出现密钥内容
     assert "key" not in response.text.lower()
 

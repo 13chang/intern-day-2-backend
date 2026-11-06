@@ -95,12 +95,26 @@ class ActivityOut(BaseModel):
     skipped_reason: str | None = None
 
 
+class GenerateIn(BaseModel):
+    """生成请求体：用哪个引擎、有什么偏好。
+
+    以前生成只有一种方式（本地规则），现在右上角那个按钮也能选 DeepSeek，
+    所以引擎和偏好从"建议面板的临时条件"升成了生成参数。
+    """
+
+    engine: str = Field(default="rule", pattern="^(rule|llm)$", description="rule=本地规则，llm=真实模型")
+    note: str | None = Field(default=None, max_length=200, description="自然语言偏好，只给 llm 用")
+
+
 class GenerateOut(BaseModel):
     # 回显目标日期：页面上同时能看今天和未来几天，客户端据此确认"这批是排给哪天的"
     day: str = ""
     created: int
     activities: list[ActivityOut]
     notice: str = ""
+    mode: str = Field(default="rule", description="这批是谁排的")
+    # 真实模型的排程理由。规则引擎没有这一段（它的理由就是"平均分布"）
+    explanation: str = ""
 
 
 class PostponeOut(BaseModel):
@@ -247,12 +261,27 @@ def overview(
 
 @router.post("/generate", response_model=GenerateOut, summary="生成某天的安排")
 def generate(
+    payload: GenerateIn | None = None,
     force: bool = Query(default=False, description="true 时重建那天待执行的安排"),
     day: date | None = Query(default=None, description="不传就是今天；最远到今天 +14 天"),
     user: dict = Depends(get_current_user),
 ) -> dict:
+    """生成并**直接落库**（不像 ``/suggestions`` 那样只给草稿）。
+
+    引擎由请求体里的 ``engine`` 决定，两个引擎共用同一条校验与写入路径。
+    """
+    request = payload or GenerateIn()
     try:
-        return service.generate_day(user["id"], day or rules.now_local().date(), force)
+        return service.generate_day(
+            user["id"],
+            day or rules.now_local().date(),
+            force,
+            engine=request.engine,
+            note=(request.note or "").strip(),
+        )
+    except planner.LlmUnavailable as exc:
+        # 用户明确选了 DeepSeek，就如实报错，不要偷偷用规则引擎顶上
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     except rules.RuleViolation as exc:
         raise _http(exc) from exc
 

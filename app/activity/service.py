@@ -16,7 +16,7 @@ import sqlite3
 import time
 from datetime import date, datetime, timedelta
 
-from app.activity import rules
+from app.activity import planner, rules
 from app.db import get_conn
 
 DEFAULT_WINDOWS = [
@@ -350,31 +350,58 @@ def _log_event(
     )
 
 
-def generate_day(user_id: int, day: date, force: bool = False) -> dict:
+def generate_day(
+    user_id: int,
+    day: date,
+    force: bool = False,
+    *,
+    engine: str = "rule",
+    note: str = "",
+) -> dict:
     """按当前设置生成某一天的安排（默认调用方传今天，也可以往前排）。
 
     当天已经有任何记录就不再生成，除非 ``force=true``。这样"点两次生成"不会变成六条；
     也不能只看 ``planned``——全部做完之后再点一次生成，旧逻辑会认为"今天还空着"，
     于是在同一批时刻上再排一遍，页面上就成了两行同一时间。
+
+    ``engine`` 选生成方式：``rule``（本地规则）或 ``llm``（真实模型）。
+    两条路的落库路径是同一条 —— 模型给的草稿同样要过 ``validate_slot``
+    （``planner.plan`` 里逐条校验过），不存在"模型能塞进不合规的时间"。
     """
     settings = get_settings(user_id)
     now = rules.now_local()
     # 日期本身就是越界的（过去的日子、两周以后），先说清楚，别让它变成"没有可用时段"
     rules.ensure_plannable(day, now.date())
 
-    with get_conn() as conn:
-        existing = _load_day(conn, user_id, day)
-        if existing and not force:
-            return {
-                "created": 0,
-                "day": day.isoformat(),
-                "activities": existing,
-                "notice": f"{rules.day_label(day, now.date())}已经有安排了，未重复生成。需要重排可以重建。",
-            }
+    existing = list_day(user_id, day)
+    if existing and not force:
+        return {
+            "created": 0,
+            "day": day.isoformat(),
+            "activities": existing,
+            "notice": f"{rules.day_label(day, now.date())}已经有安排了，未重复生成。需要重排可以重建。",
+        }
 
+    # 重排时要避开的既有时刻：只清待执行的那批，已完成/已推迟/已跳过是历史记录，
+    # 删掉会让周统计对不上。所以 force 时先按"去掉 planned"的口径算草稿，
+    # 而清理放到写事务里和插入一起做（见下）。
+    busy = [row for row in existing if row["status"] != "planned"] if force else existing
+
+    # 先算草稿，再开写事务。真实模型是一次几秒的网络调用，
+    # 拿着 SQLite 写锁等模型会把同一时刻的其他写请求一起卡住。
+    # 反过来也有好处：模型调用失败时数据库还没动过，那天的计划不会被清空。
+    explanation = ""
+    dropped = 0
+    if engine == "llm":
+        drafts, explanation, dropped = planner.plan(
+            settings, day, busy, now, settings["daily_target"], note
+        )
+    else:
+        drafts, _ = rules.plan_day(settings, day, busy, now, settings["daily_target"])
+
+    stamp = int(time.time())
+    with get_conn() as conn:
         if force:
-            # 只清待执行的：已完成/已推迟/已跳过是历史记录，删掉会让周统计对不上。
-            # 清完之后重排仍要避开这些历史时刻，否则又会排到同一时间。
             conn.execute(
                 """
                 DELETE FROM activities
@@ -382,11 +409,6 @@ def generate_day(user_id: int, day: date, force: bool = False) -> dict:
                 """,
                 (user_id, day.isoformat()),
             )
-            existing = [row for row in existing if row["status"] != "planned"]
-
-        drafts, feasible = rules.plan_day(settings, day, existing, now, settings["daily_target"])
-
-        stamp = int(time.time())
         for draft in drafts:
             activity_id = _insert_activity(
                 conn,
@@ -396,17 +418,29 @@ def generate_day(user_id: int, day: date, force: bool = False) -> dict:
                 title=draft.title,
                 description=draft.description,
                 duration_min=draft.duration_min,
-                source="rule",
+                source="agent" if engine == "llm" else "rule",
                 stamp=stamp,
             )
-            _log_event(conn, user_id, activity_id, "generate", to_status="planned")
+            # note 记下这批是谁排的：事后看 activity_events 能分清规则和模型
+            _log_event(
+                conn, user_id, activity_id, "generate", to_status="planned", note=engine
+            )
 
         activities = _load_day(conn, user_id, day)
 
-    notice = ""
-    if feasible < settings["daily_target"]:
-        notice = f"可用时间只够安排 {feasible} 次，已按 {feasible} 次生成。"
-    return {"created": len(drafts), "day": day.isoformat(), "activities": activities, "notice": notice}
+    notices = []
+    if len(drafts) < settings["daily_target"]:
+        notices.append(f"可用时间只够安排 {len(drafts)} 次，已按 {len(drafts)} 次生成。")
+    if dropped:
+        notices.append(f"模型有 {dropped} 条建议不满足条件，已丢弃。")
+    return {
+        "created": len(drafts),
+        "day": day.isoformat(),
+        "activities": activities,
+        "notice": "".join(notices),
+        "mode": engine,
+        "explanation": explanation,
+    }
 
 
 def suggest_day(

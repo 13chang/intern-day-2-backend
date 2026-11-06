@@ -645,3 +645,99 @@ def test_llm_engine_rejects_past_day_without_calling_the_model(
     assert status == 422
     assert "已经过去" in body["detail"]
     assert calls == [], "条件已经不可能满足，不该再调模型"
+
+
+# ---------------------------------------------------------------- 生成也走模型
+
+def test_generate_with_llm_engine_saves_the_drafts(client: TestClient, demo: dict, frozen, llm) -> None:
+    """「生成」按钮选 DeepSeek 时要真的落库，而不是只给一份草稿。"""
+    save_settings(client, demo["headers"])
+    llm(
+        {
+            "explanation": "上午一次下午一次",
+            "suggestions": [
+                {"time": "10:20", "activity_type": "walk", "title": "起身走走",
+                 "description": "走一小段", "reason": "上午"},
+                {"time": "16:10", "activity_type": "stand", "title": "站起来",
+                 "description": "活动腿脚", "reason": "下午"},
+            ],
+        }
+    )
+
+    response = client.post(
+        "/activity/generate", headers=demo["headers"], json={"engine": "llm"}
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["mode"] == "llm"
+    assert body["created"] == 2
+    assert body["explanation"] == "上午一次下午一次"
+    assert [item["scheduled_at"][11:16] for item in body["activities"]] == ["10:20", "16:10"]
+    # 来源要能分清是谁排的：rule 和 agent 混在一条列表里，事后要能追溯
+    assert {item["source"] for item in body["activities"]} == {"agent"}
+    # 确认真的写进了库，而不只是响应里带了
+    listed = client.get("/activity/today", headers=demo["headers"]).json()
+    assert len(listed) == 2
+
+
+def test_generate_with_llm_unconfigured_is_409(client: TestClient, demo: dict, frozen) -> None:
+    """后端没配真实模型时如实报错，不能偷偷用规则引擎顶上。"""
+    save_settings(client, demo["headers"])
+
+    response = client.post(
+        "/activity/generate", headers=demo["headers"], json={"engine": "llm"}
+    )
+
+    assert response.status_code == 409
+    assert "Mock" in response.json()["detail"]
+
+
+def test_generate_with_llm_keeps_existing_plan_when_model_fails(
+    client: TestClient, demo: dict, frozen
+) -> None:
+    """模型失败时不能把那天已经排好的东西清空。
+
+    草稿是在写事务**之前**算的（``service.generate_day`` 里 draft 先行），
+    所以 force 重建时模型一挂，旧计划原样还在。反过来说，
+    如果哪天把 ``plan`` 挪到了 DELETE 之后，这条会立刻红。
+    """
+    save_settings(client, demo["headers"])
+    first = client.post("/activity/generate", headers=demo["headers"]).json()
+    assert first["created"] == 3
+
+    failed = client.post(
+        "/activity/generate?force=true", headers=demo["headers"], json={"engine": "llm"}
+    )
+    assert failed.status_code == 409
+
+    rows = client.get("/activity/today", headers=demo["headers"]).json()
+    assert len(rows) == 3, "模型调用失败不该动数据库"
+
+
+def test_generate_passes_note_to_the_prompt(client: TestClient, demo: dict, frozen, monkeypatch) -> None:
+    """偏好是"这次生成"的参数，必须真的进到提示词里，否则用户填了等于没填。"""
+    save_settings(client, demo["headers"])
+    prompts: list[str] = []
+    payload = json.dumps(
+        {
+            "explanation": "按你下午容易困的说法，排一次走动",
+            "suggestions": [
+                {"time": "10:30", "activity_type": "walk", "title": "起身走走",
+                 "description": "走一小段", "reason": "上午"},
+            ],
+        }
+    )
+    monkeypatch.setattr(
+        planner, "default_completer", lambda: (lambda prompt: prompts.append(prompt) or payload)
+    )
+
+    response = client.post(
+        "/activity/generate",
+        headers=demo["headers"],
+        json={"engine": "llm", "note": "下午容易困"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert prompts, "引擎选了 llm 却没调模型"
+    assert "下午容易困" in prompts[0]

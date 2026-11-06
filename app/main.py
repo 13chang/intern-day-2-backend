@@ -10,6 +10,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.db import init_db
+from app.observability import setup_observability
 from app.routers import agent, auth, items
 
 DEFAULT_CORS_ORIGINS = "http://localhost:5173,http://127.0.0.1:5173"
@@ -24,6 +25,9 @@ def cors_origins() -> list[str]:
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     # 启动时确保表结构存在，重复执行安全。
     init_db()
+    # 观测是横切关注点：只在这里挂一次，业务代码不感知。
+    # 内部对「一个进程只能配一次 Provider」做了幂等，测试里反复进 lifespan 也不会重复配置。
+    setup_observability()
     yield
 
 

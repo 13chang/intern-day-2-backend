@@ -1,0 +1,51 @@
+{
+  "mode": "mock",
+  "trace": {
+    "trace_id": "9f6be3a65ef2f859adabd52e5eca12c8",
+    "span_count": 2,
+    "started_ms": 0,
+    "total_ms": 182,
+    "finished_ns": 1793871858857178117,
+    "spans": [
+      {
+        "name": "invoke_agent todo-assistant",
+        "span_id": "6b92a8ed6ed640b5",
+        "parent_id": null,
+        "duration_ms": 182,
+        "attributes": {
+          "gen_ai.operation.name": "invoke_agent",
+          "gen_ai.agent.name": "todo-assistant"
+        },
+        "status": "UNSET"
+      },
+      {
+        "name": "execute_tool list_my_todos",
+        "span_id": "8ccf52e47bef5db8",
+        "parent_id": "6b92a8ed6ed640b5",
+        "duration_ms": 2,
+        "attributes": {
+          "gen_ai.operation.name": "execute_tool",
+          "gen_ai.tool.name": "list_my_todos"
+        },
+        "status": "UNSET"
+      }
+    ]
+  },
+  "checks": [
+    {
+      "name": "至少 2 个 span（Agent + 工具）",
+      "passed": true,
+      "detail": "实际 2：['invoke_agent todo-assistant', 'execute_tool list_my_todos']"
+    },
+    {
+      "name": "存在 execute_tool 且工具名正确",
+      "passed": true,
+      "detail": "实际 [{gen_ai.operation.name: 'execute_tool', gen_ai.tool.name: 'list_my_todos'}]"
+    },
+    {
+      "name": "属性里没有对话原文",
+      "passed": true,
+      "detail": "[{\"gen_ai.operation.name\": \"invoke_agent\", \"gen_ai.agent.name\": \"todo-assistant\"}, {\"gen_ai.operation.name\": \"execute_tool\", \"gen_ai.tool.name\": \"list_my_todos\""
+    }
+  ]
+}

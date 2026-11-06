@@ -559,7 +559,7 @@ invoke_agent todo-assistant  1723ms
 
 ```bash
 uv run pytest -q
-# 235 passed
+# 236 passed
 ```
 
 新增四个文件：
@@ -570,7 +570,7 @@ uv run pytest -q
 - `tests/test_activity_api.py`（19 个用例）：设置默认值与校验、生成幂等、三个操作的状态流转与幂等、
   推迟无时段时原条仍 `planned`、周统计四个数字、建议不落库、确认时免打扰被拒并带序号、
   跨用户 404 与数据隔离；
-- `tests/test_activity_llm.py`（25 个用例）：引擎可用性、模型产出经校验后才算数、
+- `tests/test_activity_llm.py`（26 个用例）：引擎可用性、模型产出经校验后才算数、
   不合规建议被丢弃并计数、非法活动类型连带文案一起回落、同一时间去重、
   Markdown 代码块里的 JSON、回复不是 JSON、一条都不合规则、条件覆盖（窗口/免打扰开关/次数）、
   条件自相矛盾时 422 且**根本不调模型**、偏好超出四类时提示词要求如实说明、

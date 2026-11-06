@@ -205,10 +205,23 @@ def test_prompt_tells_model_not_to_fake_unsupported_preference(frozen) -> None:
     prompt = planner.build_prompt({**SETTINGS}, DAY, [], NOW, 2, "打篮球")
 
     assert "打篮球" in prompt
+    assert "【用户的偏好】" in prompt
     assert "不要硬凑" in prompt
     assert "如实说明" in prompt
     # explanation 与建议必须一致，别一边说打球一边给拉伸
     assert "explanation 必须和建议本身一致" in prompt
+
+
+def test_prompt_omits_preference_section_when_note_is_empty(frozen) -> None:
+    """没填偏好时整段都不能出现。
+
+    占位符会被模型当内容抄进 explanation —— 线上真出现过
+    「未说明偏好，安排两次轻活动…」，用户看到的是提示词碎片。
+    """
+    prompt = planner.build_prompt({**SETTINGS}, DAY, [], NOW, 2)
+
+    assert "【用户的偏好】" not in prompt
+    assert "没特别说明" not in prompt
 
 
 def test_llm_dedupes_same_time(client: TestClient, demo: dict, frozen, llm) -> None:

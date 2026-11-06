@@ -181,7 +181,21 @@ def build_prompt(
         or "（没有）"
     )
     weekday = "一二三四五六日"[day.weekday()]
-    preference = note.strip() or "（没特别说明）"
+    # 没填偏好就把整段去掉。留一个"（没特别说明）"的占位符，模型会把它当内容抄进
+    # explanation —— 实际出现过「未说明偏好，安排两次轻活动…」，读起来像系统日志泄漏。
+    preference = note.strip()
+    preference_block = (
+        f"""【用户的偏好】
+{preference}
+
+偏好用来决定三件事：挑哪一类活动（在上面四类里）、排多密、说明怎么写。
+如果偏好落在上面四类之外（球类、健身、跑步、需要场地或器械的，例如"打篮球"），
+**不要硬凑**：照常从四类里排，并在 explanation 里如实说明这次没能排进来，
+不要声称已经满足了偏好。
+"""
+        if preference
+        else ""
+    )
 
     return f"""你是「工作间隙活动助手」的排程模块。只输出 JSON，不要任何解释性文字、不要 Markdown。
 
@@ -199,14 +213,7 @@ def build_prompt(
 【可选的活动（activity_type 只能取这四者之一）】
 {catalog_lines}
 
-【用户的偏好】
-{preference}
-
-偏好用来决定三件事：挑哪一类活动（在上面四类里）、排多密、说明怎么写。
-如果偏好落在上面四类之外（球类、健身、跑步、需要场地或器械的，例如"打篮球"），
-**不要硬凑**：照常从四类里排，并在 explanation 里如实说明这次没能排进来，
-不要声称已经满足了偏好。
-
+{preference_block}
 【输出格式】
 {{"explanation": "一句话说明你为什么这样排，中文，40 字以内",
   "suggestions": [{{"time": "HH:MM", "activity_type": "walk",

@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.db import init_db
 from app.observability import setup_observability
-from app.routers import agent, auth, items
+from app.routers import activity, agent, auth, items
 
 DEFAULT_CORS_ORIGINS = "http://localhost:5173,http://127.0.0.1:5173"
 
@@ -52,6 +52,7 @@ app.add_middleware(
 
 app.include_router(auth.router)
 app.include_router(items.router)
+app.include_router(activity.router)
 app.include_router(agent.router)
 # AG-UI 端点由官方适配函数注册，必须在 app 建好之后、启动之前挂上
 agent.install_agent_endpoint(app)

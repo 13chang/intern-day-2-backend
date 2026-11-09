@@ -72,10 +72,14 @@ def seed(username: str, day: date) -> None:
             raise SystemExit(f"找不到用户 {username!r}，先跑 scripts/seed.py 建练习账号")
         user_id = int(row["id"])
 
-        # 先清掉这一天已有的记录，保证脚本可重复执行
+        # 先清掉这一天已有的记录，保证脚本可重复执行。
+        #
+        # 清理区间比统计区间多一天：脚本会往 D+1 00:00 放一条"右开边界"样本，
+        # 只清 D 日的话，第二次执行就会撞 UNIQUE(user_id, scheduled_at) ——
+        # 报错信息只说约束冲突，看起来像统计写错了，其实只是上一次的样本没清掉。
         conn.execute(
             "DELETE FROM activities WHERE user_id = ? AND scheduled_at >= ? AND scheduled_at < ?",
-            (user_id, rules.iso(start), rules.iso(end)),
+            (user_id, rules.iso(start), rules.iso(end + timedelta(days=1))),
         )
         conn.execute(
             "DELETE FROM activity_events WHERE user_id = ? AND created_at >= ? AND created_at < ?",

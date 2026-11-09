@@ -22,6 +22,21 @@ def test_preflight_from_frontend_origin_is_allowed(client):
     assert "authorization" in response.headers.get("access-control-allow-headers", "").lower()
 
 
+# Capacitor 打包成 App 之后，WebView 里页面的来源是 http://localhost（不带端口）。
+# 少了这一条，App 里所有请求都会在预检阶段被拦掉。
+NATIVE_APP_ORIGIN = "http://localhost"
+
+
+def test_preflight_from_native_app_origin_is_allowed(client):
+    response = client.options(
+        "/items",
+        headers={**PREFLIGHT_HEADERS, "Origin": NATIVE_APP_ORIGIN},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.headers.get("access-control-allow-origin") == NATIVE_APP_ORIGIN
+
+
 def test_preflight_from_unknown_origin_is_not_allowed(client):
     response = client.options(
         "/items",

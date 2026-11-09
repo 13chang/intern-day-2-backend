@@ -17,7 +17,16 @@ from app.summary.queue import close_pool
 # 日志级别与 .env 的加载都在 app/__init__.py 里完成 ——
 # 那两件事必须早于本模块（以及它导入的 routers）执行，写在这里就太晚了。
 
-DEFAULT_CORS_ORIGINS = "http://localhost:5173,http://127.0.0.1:5173"
+# 两套来源都必须放行：
+# - 浏览器开发：vite 跑在 5173，前端直连宿主机映射出来的后端端口
+# - Capacitor 打包的 App：WebView 里页面的来源是 http://localhost（不带端口），
+#   由 capacitor.config.ts 的 server.androidScheme 决定
+# 少了后者，App 里所有请求都会卡在预检，前端只能看到一句没有细节的
+# "Failed to fetch"，排查成本很高。
+DEFAULT_CORS_ORIGINS = (
+    "http://localhost:5173,http://127.0.0.1:5173,"
+    "http://localhost,https://localhost"
+)
 
 
 def cors_origins() -> list[str]:

@@ -1,4 +1,56 @@
+# 顶部锚点：api 与 worker 必须用完全相同的一套环境变量。
+# 抄两遍迟早漏一个（尤其 APP_DB_PATH 和 MODEL_MODE），漏了的表现是
+# "api 能看到数据、worker 看不到"或者"页面用真模型、日报用模板"，
+# 都很难第一时间想到是配置不一致。用锚点强制唯一来源。
+x-backend-env: &backend-env
+  APP_DB_PATH: /app/data/app.db
+  APP_SESSION_TTL_SECONDS: "1800"
+  # 浏览器直接访问宿主机映射端口，来源为前端开发服务器
+  APP_CORS_ORIGINS: "${APP_CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}"
+  # 练习账号：可用 .env 覆盖，默认值与 README 一致
+  SEED_USERNAME: "${SEED_USERNAME:-demo}"
+  SEED_PASSWORD: "${SEED_PASSWORD:-demo1234}"
+  SEED_DISPLAY_NAME: "${SEED_DISPLAY_NAME:-练习用户}"
+  # 模型模式：只改 .env 里的 MODEL_MODE（mock / real / auto），代码不用动。
+  # 默认是 mock —— clone 下来直接起不会意外调用真实模型、烧掉额度。
+  # 密钥只从运行环境注入，不写进代码、不写进镜像构建参数、不暴露给前端。
+  MODEL_MODE: "${MODEL_MODE:-mock}"
+  OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+  OPENAI_BASE_URL: "${OPENAI_BASE_URL:-}"
+  OPENAI_MODEL: "${OPENAI_MODEL:-}"
+  # 兼容第三天的旧变量名（留空即可，MODEL_MODE 优先）
+  APP_LLM_MODE: "${APP_LLM_MODE:-}"
+  APP_LLM_BASE_URL: "${APP_LLM_BASE_URL:-}"
+  APP_LLM_MODEL: "${APP_LLM_MODEL:-}"
+  APP_LLM_API_KEY: "${APP_LLM_API_KEY:-}"
+  # 第四天：可观测性。面板默认开，span 只进内存，GET /agent/traces 可读；
+  # 不记录 prompt 与回复原文，所以可以作为 PR 证据直接贴出来。
+  APP_TRACE_PANEL: "${APP_TRACE_PANEL:-1}"
+  APP_TRACE_BUFFER_SIZE: "${APP_TRACE_BUFFER_SIZE:-400}"
+  APP_OTEL_CONSOLE: "${APP_OTEL_CONSOLE:-0}"
+  # 第五天：活动助手。
+  # 时区必须显式给：容器默认 UTC，不设的话排出来的时间会整体差 8 小时。
+  APP_TZ_OFFSET_HOURS: "${APP_TZ_OFFSET_HOURS:-8}"
+  # 用户没改过设置时的每天次数，用户仍可在页面上调整
+  APP_ACTIVITY_DAILY_TARGET: "${APP_ACTIVITY_DAILY_TARGET:-3}"
+  # 第六天：Redis + ARQ。
+  # 容器内用服务名 redis；在容器里写 localhost 指的是容器自己，那里没有 Redis。
+  APP_REDIS_HOST: "${APP_REDIS_HOST:-redis}"
+  APP_REDIS_PORT: "${APP_REDIS_PORT:-6379}"
+  APP_REDIS_DB: "${APP_REDIS_DB:-0}"
+  # 调度时区与触发时间。默认每天 00:05 生成前一天 —— 用 00:05 而不是 00:00，
+  # 是为了覆盖前一天 23:5x 才完成的记录。演示时把 MINUTE 改成 "*/2"。
+  APP_SUMMARY_TIMEZONE: "${APP_SUMMARY_TIMEZONE:-Asia/Shanghai}"
+  APP_SUMMARY_CRON_HOUR: "${APP_SUMMARY_CRON_HOUR:-0}"
+  APP_SUMMARY_CRON_MINUTE: "${APP_SUMMARY_CRON_MINUTE:-5}"
+  APP_SUMMARY_MAX_TRIES: "${APP_SUMMARY_MAX_TRIES:-3}"
+  APP_SUMMARY_JOB_TIMEOUT: "${APP_SUMMARY_JOB_TIMEOUT:-120}"
+  APP_SUMMARY_RETRY_DEFER: "${APP_SUMMARY_RETRY_DEFER:-20}"
+  APP_SUMMARY_KEEP_RESULT: "${APP_SUMMARY_KEEP_RESULT:-3600}"
+
 services:
+  # 任务书里叫 api，这里沿用仓库既有的服务名 backend，职责相同：
+  # 提供登录、活动记录、日报查询等 HTTP 接口。
   backend:
     build: .
     image: intern-day-2-backend:local
@@ -6,42 +58,54 @@ services:
     ports:
       - "8000:8000"
     environment:
-      APP_DB_PATH: /app/data/app.db
-      APP_SESSION_TTL_SECONDS: "1800"
-      # 浏览器直接访问宿主机映射端口，来源为前端开发服务器
-      APP_CORS_ORIGINS: "http://localhost:5173,http://127.0.0.1:5173"
-      # 练习账号：可用 .env 覆盖，默认值与 README 一致
-      SEED_USERNAME: "${SEED_USERNAME:-demo}"
-      SEED_PASSWORD: "${SEED_PASSWORD:-demo1234}"
-      SEED_DISPLAY_NAME: "${SEED_DISPLAY_NAME:-练习用户}"
-      # 模型模式：只改 .env 里的 MODEL_MODE（mock / real / auto），代码不用动。
-      # 默认是 mock —— clone 下来直接起不会意外调用真实模型、烧掉额度。
-      # 密钥只从运行环境注入，不写进代码、不写进镜像构建参数、不暴露给前端。
-      MODEL_MODE: "${MODEL_MODE:-mock}"
-      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
-      OPENAI_BASE_URL: "${OPENAI_BASE_URL:-}"
-      OPENAI_MODEL: "${OPENAI_MODEL:-}"
-      # 兼容第三天的旧变量名（留空即可，MODEL_MODE 优先）
-      APP_LLM_MODE: "${APP_LLM_MODE:-}"
-      APP_LLM_BASE_URL: "${APP_LLM_BASE_URL:-}"
-      APP_LLM_MODEL: "${APP_LLM_MODEL:-}"
-      APP_LLM_API_KEY: "${APP_LLM_API_KEY:-}"
-      # 第四天：可观测性。面板默认开，span 只进内存，GET /agent/traces 可读；
-      # 不记录 prompt 与回复原文，所以可以作为 PR 证据直接贴出来。
-      APP_TRACE_PANEL: "${APP_TRACE_PANEL:-1}"
-      APP_TRACE_BUFFER_SIZE: "${APP_TRACE_BUFFER_SIZE:-400}"
-      APP_OTEL_CONSOLE: "${APP_OTEL_CONSOLE:-0}"
-      # 第五天：活动助手。
-      # 时区必须显式给：容器默认 UTC，不设的话排出来的时间会整体差 8 小时。
-      APP_TZ_OFFSET_HOURS: "${APP_TZ_OFFSET_HOURS:-8}"
-      # 用户没改过设置时的每天次数，用户仍可在页面上调整
-      APP_ACTIVITY_DAILY_TARGET: "${APP_ACTIVITY_DAILY_TARGET:-3}"
+      <<: *backend-env
     # 启动前初始化练习账号；脚本可重复执行，只会重置该账号
     command: sh -c "python scripts/seed.py && uvicorn app.main:app --host 0.0.0.0 --port 8000"
     # 数据卷：容器重建后数据库文件仍在；彻底重置用 docker compose down -v
     volumes:
       - backend-data:/app/data
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Redis 只装"要做的事"：队列、调度、任务结果（有 TTL）。
+  # 日报本身进 SQLite —— Redis 被清空只影响还没跑到的任务，不会丢已经生成的日报。
+  redis:
+    image: redis:7-alpine
+    container_name: intern-day-2-redis
+    # AOF 每次写都落盘，RDB 每小时快照兜底。
+    # 本地练习用这个组合：重启不丢排队中的任务，又不会因为频繁 fsync 拖慢。
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    # 刻意不写 ports：队列只给 compose 内部用，天然不会被公网访问到
+    restart: unless-stopped
+
+  # Worker 与 backend 是同一个镜像、不同的启动命令 —— 代码只有一份，
+  # 不会出现"API 改了 Worker 没改"。
+  worker:
+    image: intern-day-2-backend:local
+    container_name: intern-day-2-worker
+    # arq 命令能直接用，是因为 Dockerfile 里 PATH 含 /app/.venv/bin
+    command: ["arq", "app.worker.WorkerSettings"]
+    environment:
+      <<: *backend-env
+    # 必须和 backend 挂同一个卷，否则读不到活动记录、写不进日报
+    volumes:
+      - backend-data:/app/data
+    depends_on:
+      redis:
+        condition: service_healthy
+    # 注意：这里不写 build:，让 compose 复用 backend 构建出来的镜像。
+    # 写了会导致同一个镜像被构建两次，还可能拿到不同时间点的代码。
     restart: unless-stopped
 
 volumes:
   backend-data:
+  redis-data:

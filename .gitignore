@@ -8,3 +8,8 @@ __pycache__/
 .vscode/
 .idea/
 .DS_Store
+
+# 本地 SQLite 数据库与手工备份（任务书要求数据库文件不进 Git）
+data/*.db
+data/*.db.bak*
+data/*.bak

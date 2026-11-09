@@ -11,10 +11,15 @@ dependencies = [
     # 两个包各自独立发版，版本号不同步，所以分别钉住。
     "agent-framework==1.24.0",
     "agent-framework-ag-ui==1.7.1",
+    "arq>=0.25.0",
 ]
 
 [tool.uv]
 package = false
+
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
 
 [dependency-groups]
 dev = [

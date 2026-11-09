@@ -194,8 +194,6 @@ def test_compose_uses_template_in_mock_mode() -> None:
 
 def test_compose_reports_permanent_error_when_config_broken(monkeypatch) -> None:
     """real 模式但配置不全时，应该是永久错误（不重试），而不是可重试错误。"""
-    from app.agent import config as agent_config
-
     monkeypatch.setenv("MODEL_MODE", "real")
     monkeypatch.setenv("APP_LLM_MODE", "real")
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)

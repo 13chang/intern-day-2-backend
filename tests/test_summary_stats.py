@@ -8,8 +8,6 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
-import pytest
-
 from app.activity import rules
 from app.db import get_conn
 from app.summary.stats import daily_stats, day_bounds

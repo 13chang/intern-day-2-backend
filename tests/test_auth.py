@@ -21,7 +21,6 @@ from tests._helpers import (
     UNAUTHORIZED_DETAIL,
     UNIFIED_LOGIN_ERROR,
     assert_unauthorized,
-    create_user,
     fetch_session_rows,
     insert_session,
 )

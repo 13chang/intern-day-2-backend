@@ -224,6 +224,9 @@ async def run_summary(
                 "status": "ready",
                 "message": "这一天已经有日报了",
             }
+        # STATUS_PENDING 是表的默认值，本项目的写入路径只会落 generating / failed，
+        # 所以正常流程里碰不到；一起判是为了兼容手工写进库的行，不至于被当成"没在跑"
+        # 而重复入队。
         if existing["status"] in (store.STATUS_GENERATING, store.STATUS_PENDING):
             alive = int(time.time()) - int(existing["updated_at"]) < _inflight_grace_seconds()
             if alive:

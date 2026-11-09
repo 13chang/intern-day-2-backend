@@ -39,7 +39,21 @@ def redis_settings(*, conn_retries: int | None = None) -> RedisSettings:
 
 
 def summary_timezone() -> str:
-    """日报与 cron 使用的时区名。"""
+    """cron **触发**用的时区名（IANA 名，交给 ARQ 的 ``WorkerSettings.timezone``）。
+
+    注意它和 ``APP_TZ_OFFSET_HOURS`` 是两个独立的配置：
+
+    - 这个变量决定 cron 在几点几分触发；
+    - ``APP_TZ_OFFSET_HOURS``（``app.activity.rules.tz``）决定活动记录与日报
+      里的时间戳偏移。
+
+    默认两者都是东八区，所以看不出区别。**如果把其中一个改成别的时区，
+    必须同时改另一个**，否则 cron 在北京时间凌晨触发、却按另一个时区的
+    "昨天"去查记录，查出来的是一整天的空数据。
+
+    ``dispatch_daily_summaries`` 算"总结哪一天"用的是 ``rules.now_local()``，
+    和接口的 ``_today()`` 同源，所以"哪天"这一层不会分叉；会分叉的只有触发时刻。
+    """
     return os.environ.get("APP_SUMMARY_TIMEZONE", "Asia/Shanghai")
 
 

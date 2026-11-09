@@ -38,6 +38,7 @@ from zoneinfo import ZoneInfo
 from arq import cron, func
 from arq.worker import Retry
 
+from app.activity import rules
 from app.db import init_db
 from app.summary import store
 from app.summary.agent import PermanentError, TransientError, compose_summary
@@ -100,7 +101,13 @@ async def dispatch_daily_summaries(ctx: dict) -> dict:
     已入队未执行的 job 会被 ``_job_id`` 挡住，已生成的日报会在
     ``generate_daily_summary`` 里被跳过。
     """
-    report_date = report_date_for(datetime.now(ZoneInfo(summary_timezone())))
+    # 时区必须来自 rules.tz()（APP_TZ_OFFSET_HOURS），和接口的 _today() 同源。
+    # 不要写 ZoneInfo(summary_timezone())：那是 cron 的**触发**时区，是另一个
+    # 可以独立配置的变量，各算各的"昨天"会在跨零点那几小时差一天 ——
+    # 表现为接口说"那一天还没结束，没有日报"。
+    # 用模块里的 datetime 而不是 rules.now_local()，是为了让测试冻结时间时
+    # 只替换 app.worker.datetime 就够（见 tests/test_summary_worker.py）。
+    report_date = report_date_for(datetime.now(rules.tz()))
     users = store.list_users_with_records(report_date)
 
     enqueued = 0

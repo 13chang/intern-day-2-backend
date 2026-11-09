@@ -817,3 +817,409 @@ suggest 明天(模型) 200  mode=llm day=2026-11-07
 过去的日子        422  "2026-11-05 已经过去了，不能给过去的日期安排活动。"
 15 天后           422  "最多只能规划到 14 天后（2026-11-20）。"
 ```
+
+---
+
+## 13. 第六天新增：Redis + ARQ 每日活动总结
+
+### 13.1 做了什么
+
+每天 00:05（Asia/Shanghai）自动为"昨天有活动记录"的用户生成一份日报：
+统计数字由后端算，回顾与建议由 Agent 写，结果存进 SQLite，页面按登录身份查询。
+
+```
+cron 00:05 ──► dispatch_daily_summaries   查昨天有记录的用户，逐个入队
+                        │ enqueue_job(_job_id=summary:{user}:{date})
+                        ▼
+                    Redis 队列  ──► generate_daily_summary  算统计 → 调 Agent → 校验 → 落库
+                        │
+                        ▼
+              GET /summary?day=   ──►  页面展示（就绪 / 生成中 / 失败 / 还没生成 / 无记录）
+```
+
+**浏览器关掉也能生成**：调度和执行都在 Worker 进程里，跟页面有没有开没有关系。
+这一条不是"顺手写上"，而是把任务从 FastAPI 里搬出去的唯一理由。
+
+### 13.2 组件怎么分工
+
+| 组件 | 存什么 | 丢了会怎样 |
+| --- | --- | --- |
+| Redis | 还没跑的任务、cron 的下次触发时间、任务结果（有 TTL，默认 1 小时） | 只丢"还没跑到的任务"，已经生成的日报一份不少 |
+| SQLite（`app.db`） | 用户、活动记录、**日报正文** | 真正的数据丢失，所以它有数据卷、有 WAL |
+
+**为什么不把日报放 Redis**：Redis 是队列不是数据库。日报要能被翻回上周三、
+要能被第二个进程读到、要能在 Redis 重启后还在 —— 这三件事都要求它是业务库里的行。
+
+**为什么 API 和 Worker 必须是两个进程**：
+
+1. 定时器只能有一个。cron 写在进程里，起两个 API 副本就是两个定时器，任务翻倍；
+2. 等模型会占住线程。一次总结要等几百毫秒到几秒，塞进 API 会拖慢登录和查询；
+3. 生命周期不同。验收要能单独停掉 Worker（验证任务在队列里排队等着），
+   而 API 停掉用户立刻感知。
+
+两个容器用**同一个镜像**，只是启动命令不同（`uvicorn ...` / `arq app.worker.WorkerSettings`），
+代码只有一份，不会出现"接口改了 Worker 没改"。
+
+**Redis 持久化**：`--appendonly yes`（AOF，每次写都落盘）+ `--save 60 1`（RDB，一分钟内有改动就快照）。
+本地练习用这个组合：`docker compose restart` 不丢排队中的任务，又不至于因为频繁 fsync 拖慢。
+Redis **不映射端口**，只在 compose 网络内部可达，队列不会被公网碰到。
+
+### 13.3 启动与"Worker 真的连上了"
+
+```bash
+cd intern-day-2-backend
+docker compose up -d --build          # 起 api / worker / redis
+docker compose logs -f worker
+```
+
+启动日志（真实输出）：
+
+```
+Starting worker for 4 functions: ping, dispatch_daily_summaries, generate_daily_summary, cron:dispatch_daily_summaries
+redis_version=7.4.11 mem_usage=1.51M clients_connected=1 db_keys=3
+worker 就绪，时区=Asia/Shanghai
+```
+
+`redis_version=...` 这一行是 arq 连上之后自己打的，等于"连通性证明"。
+另外留了一个 `ping` 任务：日报生成不出来时先跑它，能分清是"队列坏了"还是"任务逻辑坏了"。
+
+```bash
+docker compose exec backend python -c "
+import asyncio
+from arq import create_pool
+from app.summary.config import redis_settings
+async def main():
+    pool = await create_pool(redis_settings())
+    print(await pool.enqueue_job('ping', 'hello'))
+    await pool.aclose()
+asyncio.run(main())"
+# 日志：ping 收到 note=hello / ← ...:ping ● 'pong: hello'
+```
+
+### 13.4 日报日期与统计口径
+
+- **时区**：`APP_SUMMARY_TIMEZONE=Asia/Shanghai`，显式配置。容器默认 UTC，
+  不配的话 00:05 会变成北京时间 08:05，而且"总结昨天"会按 UTC 的昨天算，跨零点那八小时全错位。
+- **日报日期 = 记录所属的自然日**，生成时间另存（`updated_at`）。
+  生成时间不参与"哪一天"的判断，所以补跑上周的日报不会把日期写成今天。
+- **区间左闭右开**：`[D 00:00, D+1 00:00)`。用 `rules.at_time(D,"00:00")` 和 `+1 天` 构造，
+  和 `activities.scheduled_at`（带 `+08:00` 偏移的 ISO 串）直接做字符串比较。
+  D 日 23:59 的记录算 D 日，D+1 日 00:00 的记录不算。
+
+三个数字上的坑，都在代码里标了：
+
+1. **计划数只数原始条目**（`postponed_from IS NULL`）。推迟会新建一条替代记录，
+   把替代条也算进计划数，就会出现"排了 3 次却有 4 条计划"。
+2. **完成数可能大于计划数**。替代条目完成时 `completed +1`，但它不是新计划。
+   所以"计划 5、完成 3、跳过 1、未完成 2"加起来是 6 —— 这几个数**不能相加当总数**。
+3. **`sedentary_minutes` 恒为 `null`**。本项目没有"自报久坐时长"的入口，
+   `null` 表示未记录，**不能写 0** —— 0 分钟是一个确定的事实陈述，两者不能混。
+
+**跨日推迟怎么办**：推迟时原条留在原日期（状态 `postponed`），替代条目落在新日期。
+于是 D 日看到"计划 1、未完成 1"，D+1 日看到"计划 0、完成 1"。读起来有点怪，
+但这是事实：那次活动确实是 D+1 才做的。硬把替代条归到原日期，
+反而会让"D+1 完成了几次"算不准。
+
+### 13.5 一次任务的完整流程
+
+1. **调度**：cron 到达 → 确定目标日期（`now - 1 天`，按配置时区）→
+   查"那一天有活动记录的用户"（不扫 `users` 全表，否则给什么都没做的人白跑一次模型）→
+   逐个 `enqueue_job`。
+2. **入队**：带固定 `_job_id=summary:{user_id}:{date}`。任务参数只有用户 id 和日期字符串 ——
+   密码、Token、活动标题一律不进队列（队列里的内容会被 dump、会被日志打出来）。
+3. **执行**：`generate_daily_summary` 按固定顺序 ——
+   已 `ready` 就跳过 → 标 `generating` → 算统计 → 调 Agent → 校验 → `save_ready`。
+   `generating` 必须在**调模型之前**落库，否则页面永远看不到"生成中"这个中间态。
+4. **保存**：`ON CONFLICT(user_id, report_date) DO UPDATE ... WHERE status <> 'ready'`。
+
+`daily_stats()` 读完就关连接：模型可能跑几十秒，这段时间不能握着任何数据库句柄。
+
+### 13.6 Agent 只负责"把数字写成话"
+
+- 数字全由 `stats.daily_stats()` 算好，提示词里只放数字，**不放活动标题等自由文本** ——
+  用户能自己写标题，把自由文本喂进去等于给它一个跑偏的入口。
+- **不复用 `build_agent()`**：那个 Agent 的四个工具靠 `identity.current_user()` 取身份，
+  那是 HTTP 请求建立的 ContextVar，Worker 里读到 `None`，工具全失效。
+  所以这里新建一个 `tools=[]` 的 Agent，只用 `OpenAIChatCompletionClient`（`/chat/completions`，
+  DeepSeek 不支持 Responses API）。
+- **输出要过三道闸**（`validate_summary`）：超长截断（回顾 120 字 / 建议 80 字）、
+  含"诊断/治疗/用药/处方/药物/病情"的句子整句丢弃、编造的数字判失败。
+  数字比对只认「N 次 / N 条」，超出行数集就打回重试 —— 空日编"完成了 3 次"是最容易被抓到的错误。
+- **Mock 模式走本地模板**（`template_summary`），用真实统计填句子，`source=rule`。
+  这里**故意不用 `MockChatClient`**：它返回的是对话用的假文本，把那种文本写进日报，
+  等于给用户一份假的总结。真实模型写出来的记 `source=llm`，页面据此标注来源。
+
+### 13.7 幂等与失败：两套机制各管一段
+
+**幂等只有一层是数据库给的**：`UNIQUE(user_id, report_date)` + `ON CONFLICT`。
+不写"先 SELECT 再 INSERT"，两个 Worker 同时处理同一用户时，只有约束能挡住第二条。
+`save_ready` 返回 `cursor.rowcount > 0`，`False` 表示"另一个 Worker 已经写好了，这次是重复执行"——
+这就是"执行了几次"和"有几份日报"脱钩的地方。成功的那份**永远不会被后来的重试覆盖**。
+
+**ARQ 0.25 的重试规则决定了错误必须分两类**（`arq/worker.py` 的 `run_job`）：
+
+| 抛什么 | ARQ 行为 | 用在哪 |
+| --- | --- | --- |
+| `Retry(defer=20)` | 重试，直到 `max_tries` | 模型超时、输出不合规（`TransientError`） |
+| 普通异常 | **直接判失败，不重试** | 配置缺失（`PermanentError`）、未知异常 |
+| `CancelledError` / `RetryJob` | 重试 | 本仓库不用 |
+
+这个细节不读源码很容易写错：写成"一律 raise 等 ARQ 重试"，结果缺 API Key 也会白跑三次。
+所以 `generate_daily_summary` 里 `TransientError` 转成 `Retry`，`PermanentError` 直接抛；
+两种情况都会先把状态写成 `failed` 并记下 `error_code`（`transient` / `config` / `internal`），
+`error_message` 只放一句可读原因，**不放堆栈、不放异常原文**（原文可能带请求体或密钥片段）。
+
+**任务标识有两套**，区别是"能不能补跑"：
+
+| 场景 | 标识 | 为什么 |
+| --- | --- | --- |
+| cron 调度 | `summary:{user}:{date}` | 同一用户同一天只排一次 |
+| 手动补跑 | `summary:run:{user}:{date}:{第几分钟}` | 固定键会导致**失败后一小时内都补跑不了** |
+
+第二行是踩出来的：arq 的 `_job_id` 去重同时看 `arq:job:<id>` 和 `arq:result:<id>`，
+结果键的存活时间由 `keep_result` 决定（默认 1 小时）。用固定键时，
+一次失败之后手动补跑会静默入队失败 —— 页面停在"生成失败"，接口却回"已在队列中"。
+带上分钟既挡住连点，也让一分钟后的补跑真能进队。
+
+**卡在 `generating` 的兜底**：如果 `updated_at` 超过宽限期
+（`job_timeout × max_tries + retry_defer × max_tries`，默认 420 秒）还停在 `generating`，
+说明 Worker 已经不在了，手动触发接口允许重新入队，否则这一天会永远卡在"生成中"。
+
+### 13.8 接口
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `GET` | `/summary?day=YYYY-MM-DD` | 查某人某天的日报，不传就是昨天，**只读、不触发任何生成** |
+| `POST` | `/summary/run?day=YYYY-MM-DD` | 立即生成/补跑，**只入队、立刻返回**，最多回看 7 天 |
+
+两个接口都要登录；`user_id` 只从 `Authorization` 解析出来，SQL 里固定 `WHERE user_id = ?` ——
+没有任何参数能让调用方指定别人的 `user_id`，越权在结构上就不成立。
+
+`GET` 的 `status` 四态 + 一种数据状态，直接对应页面文案：
+
+| status | 页面 |
+| --- | --- |
+| `missing` | 这一天还没有日报，可以点「立即生成」（**不是 404**，是 200） |
+| `pending` / `generating` | 正在生成，可轮询 |
+| `ready` | 展示数字 + 回顾 + 建议 |
+| `failed` | 生成失败（只显示 `error_message`），可重试 |
+| `ready` 且 `has_records=false` | 追加提示"这一天没有活动记录，未记录久坐情况" |
+
+`has_records` 没有单独存字段，由计数反推：一条活动记录的状态必然是
+`completed / skipped / planned / postponed`，而 `planned` 与 `postponed` 都算进 `unfinished`，
+所以 `completed + skipped + unfinished == 0` 等价于"这一天没有任何记录"（含跨日推迟那种
+`planned_total=0` 但确实有记录的日子）。
+
+`POST` 四种"没入队"分开返回，因为页面的下一步不一样：
+
+```json
+{"queued": false, "status": "ready",        "message": "这一天已经有日报了"}
+{"queued": false, "status": "generating",   "message": "正在生成，稍等一会儿再刷新"}
+{"queued": false, "status": "deduplicated", "message": "刚提交过一次，请等任务执行完再刷新"}
+{"queued": true,  "status": "queued",       "job_id": "summary:run:1:2026-11-08:29412345"}
+```
+
+Redis 挂了返回 **503** `"任务队列暂不可用，请稍后再试"`，不会假装成功。
+连接池是惰性建在 `app.state` 上的：Redis 挂着的时候，登录、活动记录、日报查询都照常，
+只有这一个按钮不可用 —— 把 Redis 当启动硬依赖，等于让一个可选组件拖垮整个后端。
+
+### 13.9 环境变量
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `APP_REDIS_HOST` | `redis` | compose 服务名。容器里写 `localhost` 指的是容器自己 |
+| `APP_REDIS_PORT` / `APP_REDIS_DB` | `6379` / `0` | 队列默认 0 号库 |
+| `APP_SUMMARY_TIMEZONE` | `Asia/Shanghai` | 调度与日报日期用的时区，**必须显式给** |
+| `APP_SUMMARY_CRON_HOUR` / `_MINUTE` | `0` / `5` | 每天什么时候生成前一天。支持 `*/2`、`1,3,5`、`*` |
+| `APP_SUMMARY_MAX_TRIES` | `3` | 单条日报最多尝试几次（含首次） |
+| `APP_SUMMARY_JOB_TIMEOUT` | `120` | 单条任务超时秒数 |
+| `APP_SUMMARY_RETRY_DEFER` | `20` | 失败后隔几秒再试 |
+| `APP_SUMMARY_KEEP_RESULT` | `3600` | 结果在 Redis 留多久，**决定 `_job_id` 去重窗口** |
+
+### 13.10 测试数据准备与指定日期补跑
+
+日报统计的是**已经结束的自然日**，而 `/activity/generate` 只能给今天和未来排活动，
+所以"昨天的完成/跳过/推迟"在页面上造不出来。用脚本造：
+
+```bash
+docker compose exec backend python scripts/seed_activity_demo.py
+```
+
+它给 `demo` 造昨天这一组（可重复执行，只动指定用户指定那一天）：
+
+| 时间 | 状态 | 验证点 |
+| --- | --- | --- |
+| D 00:00 | completed | 左闭边界，算进这一天 |
+| D 09:30 | completed | 普通完成 |
+| D 14:00 | skipped | 跳过 |
+| D 16:00 | postponed | 被推迟的原条 |
+| D 17:00 | planned（推迟替代） | `postponed_from` 指向 16:00 |
+| D 23:59 | completed | 右开边界前一刻，算进这一天 |
+| D+1 00:00 | planned | 右开边界，**不算**进这一天 |
+
+预期统计：`planned_total=5 completed=3 skipped=1 unfinished=2 postpone_ops=1`。
+
+补跑（不需要重新造数据，也不用手动调 cron）：
+
+```bash
+# 拿令牌
+TOKEN=$(curl -s -X POST localhost:8000/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"demo","password":"demo1234"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+
+# 触发补跑（只入队，立刻返回）
+curl -s -X POST "localhost:8000/summary/run?day=2026-11-08" -H "Authorization: Bearer $TOKEN"
+
+# 查结果
+curl -s "localhost:8000/summary?day=2026-11-08" -H "Authorization: Bearer $TOKEN"
+```
+
+**临时把 cron 改成高频**（验收"自动执行"用，演示完必须改回来）：
+
+```bash
+APP_SUMMARY_CRON_HOUR="*" APP_SUMMARY_CRON_MINUTE="*/2" docker compose up -d worker
+# 演示完恢复默认
+docker compose up -d worker
+```
+
+`APP_SUMMARY_CRON_*` 是**启动时读一次**的，改了环境变量必须重建 worker 容器才生效。
+
+### 13.11 自测记录（2026-11-08 / 11-09 实跑）
+
+八个场景都在容器里真跑过，Redis 用的是容器里的 redis 7.4.11，模型是 DeepSeek（`source=llm`）。
+
+**1. 自动执行（不点任何按钮）**
+
+把 cron 临时改成每分钟的偶数分钟（`APP_SUMMARY_CRON_HOUR="*" APP_SUMMARY_CRON_MINUTE="*/2"`），
+Worker 日志按顺序出现：
+
+```
+02:54:35 Starting worker for 4 functions: ... cron:dispatch_daily_summaries
+02:58:00 调度完成 date=2026-11-08 有记录用户=1 新入队=1
+02:58:00   0.50s → summary:1:2026-11-08:generate_daily_summary(1, '2026-11-08')
+02:58:01 日报生成完成 user=1 date=2026-11-08 source=llm wrote=True
+```
+
+这一轮没点过页面、没调过接口。中途还撞到一个真实现象：第一次触发时日志是
+`新入队=0` —— 十分钟前的手工验证在 Redis 里留了同名任务的结果键（`keep_result=3600`），
+被 `_job_id` 挡住了。这正好印证 §13.7 的说法：ARQ 的标识只减少重复入队，不能当幂等。
+
+**2. 统计正确**
+
+用 `seed_activity_demo.py` 造了六个时间点的活动（含两个日期边界和一个推迟替代条），
+接口返回与脚本自算完全一致：
+
+```
+GET /summary?day=2026-11-08
+planned_total=5  completed=3  skipped=1  unfinished=2  postpone_ops=1
+sedentary_minutes=null  has_records=true  source=llm  model=deepseek-chat
+回顾：这一天计划了 5 次活动，完成 3 次，跳过 1 次，还有 2 次没处理，另有 1 次推迟操作；未记录久坐情况。
+建议：把没处理的那 2 次活动安排到午休后和晚饭前，各做一次。
+```
+
+边界：`D 00:00` 与 `D 23:59` 计入，`D+1 00:00` 不计入（两者都在样本数据里）。
+`completed + skipped + unfinished = 6 > planned_total = 5`，因为这个和里含推迟产生的替代条。
+
+**3. 无记录**
+
+`GET/POST` 2026-11-07（那天没有任何活动）：
+
+```
+status=ready  has_records=false  planned_total=0  sedentary_minutes=null
+回顾：这一天没有活动记录，也未记录久坐情况。
+```
+
+既没编次数，也没写"久坐 0 分钟"。
+
+**4. 重复执行**
+
+对一个已 `ready` 的日期用固定标识再投一次任务：
+
+```
+0.29s → summary:1:2026-11-07:generate_daily_summary(1, '2026-11-07')
+日报已存在，跳过 user=1 date=2026-11-07
+0.00s ← ...:generate_daily_summary ● {'status': 'skipped', 'reason': 'already_ready'}
+```
+
+每日行数 `('2026-11-06',1) ('2026-11-07',1) ('2026-11-08',1)`，没有第二份。
+
+**5. 失败与恢复**
+
+用坏配置重建 Worker（`OPENAI_BASE_URL=http://127.0.0.1:9/v1`、`APP_SUMMARY_MAX_TRIES=2`、
+`APP_SUMMARY_RETRY_DEFER=2`）触发 2026-11-06：
+
+```
+日报生成失败（稍后重试）user=1 date=2026-11-06: 模型调用失败（ChatClientException）
+1.94s ↻ summary:run:1:2026-11-06:...generate_daily_summary retrying job in 2.00s
+日报生成失败（稍后重试）...
+max retries 2 exceeded
+```
+
+接口侧同时看到 `status=generating` → `status=failed, error_code=transient`。
+把 Worker 恢复成正常配置后再补跑同一天：`日报生成完成 user=1 date=2026-11-06 source=llm wrote=True`，
+`status=ready`，上一次的 `error_code` 被清空。
+
+**6. Worker 暂停**
+
+`docker compose stop worker` → `POST /summary/run?day=2026-11-07` 返回
+`queued=true`，3 秒后 `GET` 仍是 `status=missing`（任务躺在队列里，没人领取）。
+`docker compose start worker` 后：
+
+```
+02:03:26   7.63s → summary:run:1:2026-11-07:...:generate_daily_summary(1, '2026-11-07') delayed=7.63s
+02:03:27 日报生成完成 user=1 date=2026-11-07 source=llm wrote=True
+```
+
+`delayed=7.63s` 就是它排队等候的时间。中途被 kill 导致的重复执行由场景 4 覆盖。
+
+**7. 持久化与权限**
+
+`docker compose restart backend` 之后再查三天，全部 `status=ready`，内容与重启前一致。
+换 `demo2` 账号查同一天，拿到的是它自己的 `status=missing`、`review=null`；
+不带令牌是 401。
+
+**8. Redis 异常**
+
+`docker compose stop redis` 之后：
+
+```
+GET  /summary?day=2026-11-08  -> HTTP 200 status=ready   （查询不依赖 Redis）
+POST /summary/run?day=2026-11-05 -> HTTP 503 {"detail": "任务队列暂不可用，请稍后再试"}
+```
+
+没有假装入队成功。
+
+**自动化测试**
+
+```bash
+uv run pytest -q
+# 362 passed
+```
+
+新增四个文件：`tests/test_summary_stats.py`（10）、`tests/test_summary_idempotency.py`（9）、
+`tests/test_summary_agent.py`（20）、`tests/test_summary_worker.py`（29）、
+`tests/test_summary_api.py`（23）。覆盖：日期边界与跨日推迟、计划数不重复计替代条、
+`sedentary_minutes` 恒 null、唯一约束在数据库层生效、`ready` 不被覆盖、
+`Retry` 与普通异常的分工、`generating` 早于模型调用、相对时间词改写、
+四种"没入队"状态、Redis 挂掉返回 503、跨用户隔离。
+
+### 13.12 已知限制
+
+- **停机期间的 cron 不会补跑**。ARQ 的 cron 只在进程活着时按点触发；Worker 停了半小时，
+  这半小时里到点的调度就没了。补跑要手动调 `POST /summary/run?day=`（最多回看 7 天）。
+  这不是"待优化"，是 cron 的语义：它触发的是"到点了做一件事"，不是"补齐所有应该做的事"。
+  真要做补偿得存一张"应生成清单"再对账，超出今天的范围。
+- **`sedentary_minutes` 一直是 null**。本项目没有"自报久坐时长"的入口，
+  所以日报永远写"未记录久坐情况"。加一个自报接口就能填上，但今天没做。
+- **只有最近 7 天能补跑**。`MAX_BACKFILL_DAYS=7` 是硬编码的常量，不是环境变量 ——
+  它的作用是防误操作一次排上百个模型调用，真要改应该连着 UI 一起改。
+- **两个 Worker 同时跑同一用户**：数据库约束保证只有一份日报，另一个任务会走
+  `save_ready → False` 分支返回 `duplicate`，但那次模型调用白花了。
+  只有单 Worker 部署时不会发生。
+- **本机环境的端口映射**：这个 WSL 环境里从宿主访问 `localhost:8000` 会握手成功但
+  请求得不到响应（容器内 `127.0.0.1:8000` 正常），所以本次接口自查是在容器内发请求完成的。
+  §12.7 记录过同类现象。换正常的开发机不受影响。
+- **前端还没做**。本次只提交后端；页面按 `GET /summary` 的 `status` 分支渲染即可，
+  字段名已按前端 `DailySummary` 的形态设计。
+
+

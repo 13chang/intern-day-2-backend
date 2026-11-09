@@ -31,6 +31,11 @@ services:
       APP_TRACE_PANEL: "${APP_TRACE_PANEL:-1}"
       APP_TRACE_BUFFER_SIZE: "${APP_TRACE_BUFFER_SIZE:-400}"
       APP_OTEL_CONSOLE: "${APP_OTEL_CONSOLE:-0}"
+      # 第五天：活动助手。
+      # 时区必须显式给：容器默认 UTC，不设的话排出来的时间会整体差 8 小时。
+      APP_TZ_OFFSET_HOURS: "${APP_TZ_OFFSET_HOURS:-8}"
+      # 用户没改过设置时的每天次数，用户仍可在页面上调整
+      APP_ACTIVITY_DAILY_TARGET: "${APP_ACTIVITY_DAILY_TARGET:-3}"
     # 启动前初始化练习账号；脚本可重复执行，只会重置该账号
     command: sh -c "python scripts/seed.py && uvicorn app.main:app --host 0.0.0.0 --port 8000"
     # 数据卷：容器重建后数据库文件仍在；彻底重置用 docker compose down -v

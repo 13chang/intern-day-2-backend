@@ -32,7 +32,14 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/agent", tags=["agent"])
 
 AGENT_PATH = "/agent"
-TOOL_NAMES = ["list_my_todos"]
+# 手写常量：/agent/info 的 tools 字段就是它。
+# 加工具时必须同步这里，否则前端顶部的「只读工具 …」标签会显示旧值。
+TOOL_NAMES = [
+    "list_my_todos",
+    "get_my_activity_settings",
+    "get_my_today_activities",
+    "compute_suggested_slots",
+]
 
 
 class AgentInfo(BaseModel):

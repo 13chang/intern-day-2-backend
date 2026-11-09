@@ -6,11 +6,14 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
+
+logger = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DB_PATH = REPO_ROOT / "data" / "app.db"
@@ -41,7 +44,63 @@ CREATE TABLE IF NOT EXISTS items (
 
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_items_user ON items(user_id);
+
+CREATE TABLE IF NOT EXISTS activity_settings (
+    user_id           INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    work_start        TEXT    NOT NULL DEFAULT '09:00',
+    work_end          TEXT    NOT NULL DEFAULT '18:00',
+    windows_json      TEXT    NOT NULL DEFAULT '[]',
+    quiet_start       TEXT,
+    quiet_end         TEXT,
+    reminders_enabled INTEGER NOT NULL DEFAULT 1,
+    allow_during_work INTEGER NOT NULL DEFAULT 1,
+    daily_target      INTEGER NOT NULL DEFAULT 3,
+    postpone_policy   TEXT    NOT NULL DEFAULT 'next_slot',
+    updated_at        INTEGER NOT NULL
+);
+
+-- scheduled_at 用带偏移的 ISO 串（2026-11-06T10:30:00+08:00）：
+-- 要按天查（substr(...,1,10)）、要精确到分钟、还要人能直接读。
+-- created_at / updated_at 用秒级整数，和 items 表保持一致。
+CREATE TABLE IF NOT EXISTS activities (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id        INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    activity_type  TEXT    NOT NULL,
+    title          TEXT    NOT NULL,
+    description    TEXT    NOT NULL,
+    scheduled_at   TEXT    NOT NULL,
+    duration_min   INTEGER NOT NULL DEFAULT 5,
+    status         TEXT    NOT NULL DEFAULT 'planned',
+    source         TEXT    NOT NULL DEFAULT 'rule',
+    postponed_from INTEGER,
+    postpone_count INTEGER NOT NULL DEFAULT 0,
+    skipped_reason TEXT,
+    created_at     INTEGER NOT NULL,
+    updated_at     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_activity_user_day ON activities(user_id, scheduled_at);
+CREATE INDEX IF NOT EXISTS idx_activity_user_status ON activities(user_id, status);
+
+-- 操作流水：状态变化与统计口径的原始凭据，也方便答辩时解释"为什么这条被跳过"。
+CREATE TABLE IF NOT EXISTS activity_events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    activity_id INTEGER NOT NULL,
+    action      TEXT    NOT NULL,
+    from_status TEXT,
+    to_status   TEXT,
+    note        TEXT,
+    created_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_activity_event_user ON activity_events(user_id, created_at);
 """
+
+# 同一用户同一时刻只能有一条记录。不放进 SCHEMA 是因为老库里可能已经有历史重复数据，
+# 那样 CREATE UNIQUE INDEX 会直接抛错、应用起不来。见 init_db。
+UNIQUE_SLOT_INDEX = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_activity_user_slot "
+    "ON activities(user_id, scheduled_at)"
+)
 
 
 def db_path() -> Path:
@@ -68,6 +127,20 @@ def get_conn() -> Iterator[sqlite3.Connection]:
 
 
 def init_db() -> None:
-    """建表，可重复执行。"""
+    """建表，可重复执行。
+
+    唯一索引单独建、单独容错：老库里如果留着同一时刻的重复记录（历史 bug 的产物），
+    ``CREATE UNIQUE INDEX`` 会失败。这里只记一条警告，不让应用因此起不来；
+    清理掉重复行之后重启，索引就会补上。
+    """
     with get_conn() as conn:
         conn.executescript(SCHEMA)
+
+    with get_conn() as conn:
+        try:
+            conn.execute(UNIQUE_SLOT_INDEX)
+        except sqlite3.IntegrityError:
+            logger.warning(
+                "activities 表里还有同一时刻的重复记录，唯一索引未建立；"
+                "清理后重启即可生效。应用层仍然会拦住新的重复（busy_of_day）。"
+            )

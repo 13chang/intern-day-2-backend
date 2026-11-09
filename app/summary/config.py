@@ -18,18 +18,24 @@ import os
 from arq.connections import RedisSettings
 
 
-def redis_settings() -> RedisSettings:
+def redis_settings(*, conn_retries: int | None = None) -> RedisSettings:
     """Redis 连接参数。
 
     容器内 ``host`` 必须是 compose 服务名 ``redis`` —— 在 API 或 Worker 容器里，
     ``localhost`` 指的是容器自己，那里没有 Redis。
     本机直接跑 uvicorn/arq 时，用 ``APP_REDIS_HOST=127.0.0.1`` 覆盖。
+
+    ``conn_retries`` 只在接口侧收窄：arq 默认重试 5 次、间隔递增（1+2+3+4 秒），
+    Worker 常驻不急，但用户点"立即生成"时没人愿意等十秒才知道 Redis 挂了。
     """
-    return RedisSettings(
-        host=os.environ.get("APP_REDIS_HOST", "127.0.0.1"),
-        port=int(os.environ.get("APP_REDIS_PORT", "6379")),
-        database=int(os.environ.get("APP_REDIS_DB", "0")),
-    )
+    kwargs: dict = {
+        "host": os.environ.get("APP_REDIS_HOST", "127.0.0.1"),
+        "port": int(os.environ.get("APP_REDIS_PORT", "6379")),
+        "database": int(os.environ.get("APP_REDIS_DB", "0")),
+    }
+    if conn_retries is not None:
+        kwargs["conn_retries"] = conn_retries
+    return RedisSettings(**kwargs)
 
 
 def summary_timezone() -> str:

@@ -11,7 +11,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.db import init_db
 from app.observability import setup_observability
-from app.routers import activity, agent, auth, items
+from app.routers import activity, agent, auth, items, summary
+from app.summary.queue import close_pool
 
 # 日志级别与 .env 的加载都在 app/__init__.py 里完成 ——
 # 那两件事必须早于本模块（以及它导入的 routers）执行，写在这里就太晚了。
@@ -25,13 +26,16 @@ def cors_origins() -> list[str]:
 
 
 @asynccontextmanager
-async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     # 启动时确保表结构存在，重复执行安全。
     init_db()
     # 观测是横切关注点：只在这里挂一次，业务代码不感知。
     # 内部对「一个进程只能配一次 Provider」做了幂等，测试里反复进 lifespan 也不会重复配置。
     setup_observability()
     yield
+    # 日报入队用的 Redis 连接池是惰性创建的：一次都没点过「立即生成」就不会有池，
+    # close_pool 对这种情况直接返回。放在应用的退出钩子里，保证只关一次。
+    await close_pool(application)
 
 
 app = FastAPI(
@@ -56,6 +60,7 @@ app.add_middleware(
 app.include_router(auth.router)
 app.include_router(items.router)
 app.include_router(activity.router)
+app.include_router(summary.router)
 app.include_router(agent.router)
 # AG-UI 端点由官方适配函数注册，必须在 app 建好之后、启动之前挂上
 agent.install_agent_endpoint(app)

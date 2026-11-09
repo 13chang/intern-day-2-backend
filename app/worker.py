@@ -51,6 +51,7 @@ from app.summary.config import (
     retry_defer_seconds,
     summary_timezone,
 )
+from app.summary.queue import JOB_NAME, scheduled_job_id
 from app.summary.stats import daily_stats
 
 logger = logging.getLogger(__name__)
@@ -71,12 +72,12 @@ def report_date_for(now: datetime) -> date:
 
 
 def job_id_for(user_id: int, report_date: date) -> str:
-    """入队去重键。
+    """入队去重键（薄封装，标识格式定义在 summary/queue.py 里）。
 
-    ``_job_id`` 只在结果保留期内有效（``keep_result``），过期后同一个 id
-    可以再次入队 —— 所以它只是"减少重复排队"，真正的幂等靠数据库唯一约束。
+    接口侧入队和 cron 调度必须用同一个标识，否则"页面点了立即生成"
+    和"定时调度"会各排一趟、白跑一次模型。
     """
-    return f"summary:{user_id}:{report_date.isoformat()}"
+    return scheduled_job_id(user_id, report_date.isoformat())
 
 
 async def ping(ctx: dict, note: str = "hello") -> str:
@@ -105,7 +106,7 @@ async def dispatch_daily_summaries(ctx: dict) -> dict:
     enqueued = 0
     for user_id in users:
         job = await ctx["redis"].enqueue_job(
-            generate_daily_summary.__name__,
+            JOB_NAME,
             user_id,
             report_date.isoformat(),
             _job_id=job_id_for(user_id, report_date),
@@ -231,7 +232,15 @@ class WorkerSettings:
         func(ping, timeout=10, max_tries=1),
         # 调度只做入队，几毫秒的事；失败就等下一个 cron 周期，没必要重试
         func(dispatch_daily_summaries, timeout=60, max_tries=1),
-        func(generate_daily_summary, timeout=job_timeout(), max_tries=max_tries()),
+        # name=JOB_NAME 不能省：入队时用的是这个字符串，注册名不一致就是
+        # 运行时 "function not found"。写成变量而不是让 arq 取 __qualname__，
+        # 是为了让"注册名"和"入队名"是同一个常量。
+        func(
+            generate_daily_summary,
+            name=JOB_NAME,
+            timeout=job_timeout(),
+            max_tries=max_tries(),
+        ),
     ]
 
     cron_jobs = [

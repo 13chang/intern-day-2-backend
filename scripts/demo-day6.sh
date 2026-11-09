@@ -54,13 +54,17 @@ row() {
   $PY - "$1" "$2" <<'PY'
 import sys
 from app.db import get_conn
-user, day = sys.argv[1], sys.argv[2]
+name, day = sys.argv[1], sys.argv[2]
 with get_conn() as c:
+    u = c.execute("SELECT id FROM users WHERE username = ?", (name,)).fetchone()
+    if u is None:
+        print(f"无此用户：{name}（先跑 scripts/seed.py 建号）")
+        raise SystemExit(0)
     r = c.execute(
         "SELECT status, planned_total, completed, skipped, unfinished, postpone_ops,"
         " sedentary_minutes, source FROM daily_summaries"
         " WHERE user_id = ? AND report_date = ?",
-        (int(user), day),
+        (int(u["id"]), day),
     ).fetchone()
 if r is None:
     print("missing")
@@ -92,7 +96,7 @@ step1() {
 演示完记得把这两行删掉，恢复每天 00:05。
 TXT
   echo "当前日报状态（若已生成应看到 status=ready）："
-  row 1 "$DAY"
+  row demo "$DAY"
 }
 
 step2() {
@@ -148,7 +152,7 @@ PY
   echo "3) 期望：planned=5  completed=3  skipped=1  unfinished=2  postpone_ops=1"
   echo "   实际（库里那一行）："
   local got
-  got=$(row 1 "$DAY")
+  got=$(row demo "$DAY")
   echo "   $got"
   echo
   expect planned "$(field "$got" planned)" 5
@@ -177,7 +181,7 @@ step3() {
       API 里 sedentary_minutes 是 null（不是 0）。
 TXT
   echo "当前 demo2 的日报（若已建号并生成）："
-  row 2 "$DAY"
+  row demo2 "$DAY"
 }
 
 step4() {
@@ -189,7 +193,9 @@ import sys
 from app.db import get_conn
 with get_conn() as c:
     n = c.execute(
-        "DELETE FROM daily_summaries WHERE user_id = 1 AND report_date = ?",
+        "DELETE FROM daily_summaries"
+        " WHERE user_id = (SELECT id FROM users WHERE username = 'demo')"
+        " AND report_date = ?",
         (sys.argv[1],),
     ).rowcount
 print(f"   已清掉 {n} 行")
@@ -264,7 +270,9 @@ import sys
 from app.db import get_conn
 with get_conn() as c:
     print(c.execute(
-        "SELECT COUNT(*) FROM daily_summaries WHERE user_id = 1 AND report_date = ?",
+        "SELECT COUNT(*) FROM daily_summaries"
+        " WHERE user_id = (SELECT id FROM users WHERE username = 'demo')"
+        " AND report_date = ?",
         (sys.argv[1],),
     ).fetchone()[0])
 PY

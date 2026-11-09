@@ -158,6 +158,30 @@ def test_validate_rejects_all_medical_content() -> None:
         validate_summary(FULL_STATS, "建议进行治疗。", "可以按处方用药。")
 
 
+# ------------------------------------------------- 相对时间词（真实踩到的）
+
+def test_validate_rewrites_relative_day_words() -> None:
+    """模型会写"今天计划 3 次"，而这份日报是给已经过去的那一天的。
+
+    真实模型第一次跑出来的就是「今天计划5次活动…」，日期口径直接错了。
+    页面已经把日期显示在外面，正文里出现"今天"一定是错的，换成"这一天"。
+    """
+    review, suggestion = validate_summary(
+        FULL_STATS, "今天计划 3 次，完成 2 次。", "明天把剩下那次补上。"
+    )
+    assert "今天" not in review
+    assert "明天" not in suggestion
+    assert "这一天计划 3 次" in review
+    assert "这一天把剩下那次补上" in suggestion
+
+
+def test_validate_rewrites_longer_relative_words_first() -> None:
+    """"前天"必须先被换掉，否则被"今天"这类短词先吃一部分字符，留下残句。"""
+    review, _ = validate_summary(FULL_STATS, "前天完成 2 次，今天也完成了。", "保持。")
+    assert "前天" not in review and "今天" not in review
+    assert review.count("这一天") == 2
+
+
 # ---------------------------------------------------------------- 组合
 
 def test_compose_uses_template_in_mock_mode() -> None:

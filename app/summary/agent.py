@@ -28,6 +28,10 @@ logger = logging.getLogger(__name__)
 # 出现这些词的句子不能进日报。任务书明确不要诊断、治疗、用药建议。
 BANNED_WORDS = ("诊断", "治疗", "用药", "处方", "药物", "病情")
 
+# 相对时间词。日报描述的是已经过去的一天，这些词指向哪一天取决于生成时刻，
+# 一律换成"这一天"。长的放前面，避免"前天"被"今天"先吃掉一部分字符。
+RELATIVE_DAY_WORDS = ("大前天", "前天", "后天", "今天", "昨天", "明天")
+
 # 只抓"数字 + 量词"的组合，比如"3 次"、"2 条"。
 # 不抓所有数字，是为了不误伤"7 天"、"8 小时"这类正常表达。
 COUNT_PATTERN = re.compile(r"(\d+)\s*(?:次|条)")
@@ -63,7 +67,9 @@ SUMMARY_INSTRUCTIONS = """你是「久坐活动助手」的日报撰写模块。
    也不要声称系统检测过用户是否一直坐着。
 4. 不给疾病诊断、治疗方案、用药建议，也不给"每 X 分钟必须起身"这类统一适用的建议。
 5. 建议要具体可执行（例如"把下午那一次挪到午休后"），不要写"注意多活动"。
-6. 不要出现"作为 AI""根据你的数据"这类套话。"""
+6. 不要出现"作为 AI""根据你的数据"这类套话。
+7. 这份日报写的是**已经过去的某一天**，具体日期由页面显示。正文里一律说"这一天"，
+   不要写"今天""昨天""明天"——这类词一旦写错，整句话的日期就是错的。"""
 
 
 def build_prompt(stats: dict) -> str:
@@ -118,6 +124,24 @@ def _fabricated_counts(text: str, allowed: set[int]) -> set[int]:
     return found - allowed
 
 
+def _neutralize_relative_days(text: str) -> tuple[str, bool]:
+    """把"今天/昨天/明天"换成"这一天"。
+
+    日报写的是**已经过去的某一天**，而模型并不知道是哪一天（提示词里刻意不给
+    ``report_date``，多一个字段就多一次被它写进正文的机会）。它于是习惯性地写
+    "今天计划 5 次" —— 凌晨生成时"今天"是第二天，整句话的日期就错了。
+
+    在提示词里禁止是第一道，这里是第二道：真出现了就换掉，而不是判失败重跑
+    （换词不改变事实，重跑一次还得花一次模型调用，且很可能又写"今天"）。
+    """
+    changed = False
+    for word in RELATIVE_DAY_WORDS:
+        if word in text:
+            text = text.replace(word, "这一天")
+            changed = True
+    return text, changed
+
+
 def validate_summary(stats: dict, review: str, suggestion: str) -> tuple[str, str]:
     """校验并清洗模型输出。不合规就抛 ``TransientError`` 让 ARQ 重试。
 
@@ -152,6 +176,11 @@ def validate_summary(stats: dict, review: str, suggestion: str) -> tuple[str, st
         logger.warning("模型输出含医疗表述，已按句丢弃：review=%s suggestion=%s", dropped_r, dropped_s)
     if not clean_review or not clean_suggestion:
         raise TransientError("去掉医疗表述后内容为空")
+
+    clean_review, moved_r = _neutralize_relative_days(clean_review)
+    clean_suggestion, moved_s = _neutralize_relative_days(clean_suggestion)
+    if moved_r or moved_s:
+        logger.info("模型输出含相对时间词，已改为「这一天」：review=%s suggestion=%s", moved_r, moved_s)
 
     return clean_review[:REVIEW_MAX], clean_suggestion[:SUGGESTION_MAX]
 

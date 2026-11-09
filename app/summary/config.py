@@ -91,6 +91,15 @@ def job_timeout() -> int:
     return int(os.environ.get("APP_SUMMARY_JOB_TIMEOUT", "120"))
 
 
+def retry_defer_seconds() -> int:
+    """任务失败后隔多久重试。
+
+    给 20 秒而不是立刻重试：模型超时、连接被重置这类问题，
+    连着重试三次通常是一起失败，隔开一段时间才有意义。
+    """
+    return int(os.environ.get("APP_SUMMARY_RETRY_DEFER", "20"))
+
+
 def keep_result_seconds() -> int:
     """任务结果在 Redis 里保留多久。
 

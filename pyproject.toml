@@ -25,9 +25,13 @@ default = true
 dev = [
     "pytest>=8.3.0",
     "httpx>=0.28.0",
+    "pytest-asyncio>=1.4.1.post1",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
 addopts = "-q"
+# Worker 的任务函数都是 async（ARQ 只接受协程函数），测它们就得跑事件循环。
+# auto 模式下 async def 用例自动被 pytest-asyncio 接管，不用每条都挂装饰器。
+asyncio_mode = "auto"

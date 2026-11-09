@@ -898,8 +898,16 @@ asyncio.run(main())"
 
 ### 13.4 日报日期与统计口径
 
-- **时区**：`APP_SUMMARY_TIMEZONE=Asia/Shanghai`，显式配置。容器默认 UTC，
-  不配的话 00:05 会变成北京时间 08:05，而且"总结昨天"会按 UTC 的昨天算，跨零点那八小时全错位。
+- **时区分两个变量，各管一件事**：
+  - `APP_SUMMARY_TIMEZONE=Asia/Shanghai` 决定 cron **在几点几分触发**（交给 ARQ 的
+    `WorkerSettings.timezone`）；
+  - `APP_TZ_OFFSET_HOURS=8`（Activity 那边就在用）决定**活动记录与日报里的时间戳偏移**，
+    `dispatch_daily_summaries` 算"总结哪一天"也走它（`datetime.now(rules.tz())`），
+    和接口的 `_today()` 同源。
+
+  默认两者都是东八区，看不出区别。**要改就两个一起改** —— 只改一个的话，cron 在
+  北京时间凌晨触发、却按另一个时区的"昨天"查记录，查出来是一整天的空数据，
+  而接口只会回"那一天还没结束，没有日报"，很难查。
 - **日报日期 = 记录所属的自然日**，生成时间另存（`updated_at`）。
   生成时间不参与"哪一天"的判断，所以补跑上周的日报不会把日期写成今天。
 - **区间左闭右开**：`[D 00:00, D+1 00:00)`。用 `rules.at_time(D,"00:00")` 和 `+1 天` 构造，
@@ -1029,7 +1037,7 @@ Redis 挂了返回 **503** `"任务队列暂不可用，请稍后再试"`，不�
 | --- | --- | --- |
 | `APP_REDIS_HOST` | `redis` | compose 服务名。容器里写 `localhost` 指的是容器自己 |
 | `APP_REDIS_PORT` / `APP_REDIS_DB` | `6379` / `0` | 队列默认 0 号库 |
-| `APP_SUMMARY_TIMEZONE` | `Asia/Shanghai` | 调度与日报日期用的时区，**必须显式给** |
+| `APP_SUMMARY_TIMEZONE` | `Asia/Shanghai` | cron **触发**时区，**必须显式给**。报告日期的时区跟着 `APP_TZ_OFFSET_HOURS`，改时区要两个一起改 |
 | `APP_SUMMARY_CRON_HOUR` / `_MINUTE` | `0` / `5` | 每天什么时候生成前一天。支持 `*/2`、`1,3,5`、`*` |
 | `APP_SUMMARY_MAX_TRIES` | `3` | 单条日报最多尝试几次（含首次） |
 | `APP_SUMMARY_JOB_TIMEOUT` | `120` | 单条任务超时秒数 |

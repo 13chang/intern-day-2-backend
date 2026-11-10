@@ -51,3 +51,18 @@ def test_simple_request_carries_allow_origin(client):
 
     assert response.status_code == 200
     assert response.headers.get("access-control-allow-origin") == FRONTEND_ORIGIN
+
+
+# 真正踩过的坑不在默认值，而在 .env：
+# 每台机器的 APP_CORS_ORIGINS 都不一样（端口不同、要联调局域网 IP），
+# 一旦配了这个变量，默认值就整串被替换，native origin 顺带丢掉，
+# App 里的请求又全部卡在预检。所以必须单独验证「配置覆盖后仍然放行」，
+# 只测默认场景是测不出这个回归的。
+def test_native_app_origin_survives_env_override(monkeypatch):
+    from app.main import cors_origins
+
+    monkeypatch.setenv("APP_CORS_ORIGINS", FRONTEND_ORIGIN)
+    origins = cors_origins()
+
+    assert FRONTEND_ORIGIN in origins
+    assert NATIVE_APP_ORIGIN in origins

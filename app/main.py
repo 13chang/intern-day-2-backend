@@ -17,21 +17,25 @@ from app.summary.queue import close_pool
 # 日志级别与 .env 的加载都在 app/__init__.py 里完成 ——
 # 那两件事必须早于本模块（以及它导入的 routers）执行，写在这里就太晚了。
 
-# 两套来源都必须放行：
-# - 浏览器开发：vite 跑在 5173，前端直连宿主机映射出来的后端端口
-# - Capacitor 打包的 App：WebView 里页面的来源是 http://localhost（不带端口），
-#   由 capacitor.config.ts 的 server.androidScheme 决定
-# 少了后者，App 里所有请求都会卡在预检，前端只能看到一句没有细节的
-# "Failed to fetch"，排查成本很高。
-DEFAULT_CORS_ORIGINS = (
-    "http://localhost:5173,http://127.0.0.1:5173,"
-    "http://localhost,https://localhost"
-)
+# Capacitor 打包成 App 之后，WebView 里页面的来源就是 http://localhost（不带端口），
+# 由 capacitor.config.ts 的 server.androidScheme 决定。这个值不随部署环境变化，
+# 所以不走 APP_CORS_ORIGINS 配置——那个变量每个环境都不一样，漏配一次就会让
+# App 里所有请求卡在预检，而前端只看到一句没有细节的 "Failed to fetch"。
+# https 那条对应 Capacitor 的默认 scheme，将来改回默认值时不用再动这里。
+NATIVE_APP_ORIGINS = ("http://localhost", "https://localhost")
+
+# 浏览器开发用的来源：vite 跑在 5173，前端直连宿主机映射出来的后端端口。
+DEFAULT_CORS_ORIGINS = "http://localhost:5173,http://127.0.0.1:5173"
 
 
 def cors_origins() -> list[str]:
     raw = os.environ.get("APP_CORS_ORIGINS", DEFAULT_CORS_ORIGINS)
-    return [origin.strip() for origin in raw.split(",") if origin.strip()]
+    origins = [origin.strip() for origin in raw.split(",") if origin.strip()]
+    # 配置里没写也要补上，这样换一台开发机、换一份 .env 都不会漏。
+    for native_origin in NATIVE_APP_ORIGINS:
+        if native_origin not in origins:
+            origins.append(native_origin)
+    return origins
 
 
 @asynccontextmanager
